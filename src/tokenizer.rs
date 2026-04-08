@@ -43,13 +43,13 @@ impl LlmTokenizer {
     }
 
     fn tokenizer_from_config(config: GGUFTokenizerConfig) -> anyhow::Result<Tokenizer> {
-        return match config.model_type.as_ref() {
+        match config.model_type.as_ref() {
             None => {
                 anyhow::bail!("Failed to retrieve model_type, which is required to build tokenizer")
             },
             Some(s) if s == "gpt2" => Self::build_bpe_tokenizer(config),
             _ => anyhow::bail!("Unknown model type: {}", config.model_type.unwrap()),
-        };
+        }
     }
 
     fn build_bpe_tokenizer(config: GGUFTokenizerConfig) -> anyhow::Result<Tokenizer> {
@@ -163,7 +163,7 @@ impl LlmTokenizer {
     }
 
     pub fn decode(&self, tokens: &[u32]) -> anyhow::Result<String> {
-        Ok(self.tokenizer.decode(tokens, true)
-            .map_err(|e| anyhow::anyhow!("{}", e))?)
+        self.tokenizer.decode(tokens, true)
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 }

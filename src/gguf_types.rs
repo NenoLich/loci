@@ -60,6 +60,7 @@ pub struct GgufKVMeta {
     pub value: GgufValue,
 }
 
+#[derive(Debug)]
 pub enum GgufValue {
     Uint8(u8),
     Int8(i8),
@@ -78,41 +79,27 @@ pub enum GgufValue {
 
 impl fmt::Display for GgufValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            GgufValue::Uint8(v) => write!(f, "{}", v),
-            GgufValue::Int8(v) => write!(f, "{}", v),
-            GgufValue::Uint16(v) => write!(f, "{}", v),
-            GgufValue::Int16(v) => write!(f, "{}", v),
-            GgufValue::Uint32(v) => write!(f, "{}", v),
-            GgufValue::Int32(v) => write!(f, "{}", v),
-            GgufValue::Float32(v) => write!(f, "{}", v),
-            GgufValue::Bool(v) => write!(f, "{}", v),
-            GgufValue::String(v) => write!(f, "{}", v),
-            GgufValue::Array(v) => {
-                    write!(f, "[")?;
-                    for (i, val) in v.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{}", val)?;
-                    }
-                    write!(f, "]")
-                },
-            GgufValue::Uint64(v) => write!(f, "{}", v),
-            GgufValue::Int64(v) => write!(f, "{}", v),
-            GgufValue::Float64(v) => write!(f, "{}", v),
+        macro_rules!  display_value {
+            ($($variant:ident),*) => {
+                match self {
+                    $(GgufValue::$variant(v) => write!(f, "{}", v),)*
+                    GgufValue::Array(v) => f.debug_list().entries(v).finish(),
+                }
+            };
         }
+
+        display_value!(Uint8, Int8, Uint16, Int16, Uint32, Int32, Float32, Bool, String, Uint64, Int64, Float64)
     }
 }
 
 impl GgufValue {
     pub fn as_u32(&self) -> Option<u32> {
-        return match self {
+        match self {
             GgufValue::Uint8(v) => Some(*v as u32),
             GgufValue::Uint16(v) => Some(*v as u32),
             GgufValue::Uint32(v) => Some(*v),
             _ => None,
-        };
+        }
     }
 
     pub fn as_bool(&self) -> Option<bool> {

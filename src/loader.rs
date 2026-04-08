@@ -27,9 +27,10 @@ impl Loader {
         let gguf_headers = GgufHeaders {
             path: path.as_ref().to_string_lossy().into_owned(),
             magic: String::from_utf8_lossy(&magic).into_owned(),
-            version: version, 
-            tensor_count: tensor_count, 
-            metadata_kv_count: metadata_kv_count};
+            version, 
+            tensor_count, 
+            metadata_kv_count
+        };
 
         let mut gguf_kv_meta_vec: Vec<GgufKVMeta> = vec![];
 
