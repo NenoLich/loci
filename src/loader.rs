@@ -3,17 +3,19 @@ use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::path::Path;
 use std::io::{Cursor, Read, Seek};
-use crate::gguf_types::{GgufHeaders, GgufType, GgufValue, GgufKVMeta, GgufInfo};
+use crate::gguf_types::{GgufHeaders, GgufType, GgufValue, GgufKVMeta, GgufInfo, GgufTensorInfo};
 use num_traits::FromPrimitive;
 use std::io::SeekFrom;
 
 pub struct Loader;
 
 impl Loader {
-    pub fn load_gguf_info(&self, path: impl AsRef<Path>, verbose: bool) -> anyhow::Result<GgufInfo> {
+    pub fn load_gguf_info(&self, path: impl AsRef<Path>, first_k_tensors: usize, verbose: bool) -> anyhow::Result<GgufInfo> {
         let file = File::open(&path)?;
         let mmap: Mmap = unsafe { MmapOptions::new().map(&file)? };
         let mut cursor = Cursor::new(&mmap[..]);
+
+        // 1. Load Headers
         let mut magic = [0u8; 4];
         cursor.read_exact(&mut magic)?;
         if &magic != b"GGUF" {
@@ -32,6 +34,7 @@ impl Loader {
             metadata_kv_count
         };
 
+        // 2. Load Metadata
         let mut gguf_kv_meta_vec: Vec<GgufKVMeta> = vec![];
 
         for _ in 0..gguf_headers.metadata_kv_count {
@@ -42,13 +45,40 @@ impl Loader {
             gguf_kv_meta_vec.push(GgufKVMeta {key, value_type, value});
         }
 
+        // 3. Load Tensor info
+
+        let mut gguf_tensor_info: Vec<GgufTensorInfo> = vec![];
+
+        for _ in 0..gguf_headers.tensor_count {
+            let name = self.read_gguf_string(&mut cursor)?;
+            let n_dims = self.read_gguf_int32(&mut cursor)?;
+            let mut shapes: Vec<i64> = vec![];
+            for _ in 0..n_dims {
+                let shape = self.read_gguf_int64(&mut cursor)?;
+                shapes.push(shape);
+            }
+
+            let ggml_type = self.read_gguf_int32(&mut cursor)?;
+            let offset = self.read_gguf_int64(&mut cursor)?;
+            gguf_tensor_info.push(GgufTensorInfo {name, n_dims, shapes, ggml_type, offset});
+        }
+
+        // 4. Get the tensor offset start
+        let alignment = self.get_byte_alignment(&gguf_kv_meta_vec);
+        let gguf_tensor_offset_start = self.get_pos_with_byte_alignment(&mut cursor, alignment);
+
         if verbose {
             self.print_gguf_headers(&gguf_headers);
             self.print_gguf_kv_meta(&gguf_kv_meta_vec);
-            self.print_gguf_tensor_info(&mut cursor, 10, gguf_headers.tensor_count)?;
+            self.print_gguf_tensor_info(&gguf_tensor_info, first_k_tensors, gguf_headers.tensor_count)?;
         }
 
-        let gguf_info = GgufInfo {headers: gguf_headers, kv_meta: gguf_kv_meta_vec};
+        let gguf_info = GgufInfo {
+            headers: gguf_headers, 
+            kv_meta: gguf_kv_meta_vec, 
+            tensor_info: gguf_tensor_info, 
+            tensor_offset_start: gguf_tensor_offset_start
+        };
         
         anyhow::Ok(gguf_info)
     }
@@ -78,22 +108,19 @@ impl Loader {
         println!("─────────────────────────────────");
     }
 
-    fn print_gguf_tensor_info(&self, cursor: &mut Cursor<&[u8]>, first_k: usize, tensor_count: u64) -> anyhow::Result<()> {
-        println!("📦 Tensors (first {} of {}):", first_k, tensor_count);
+    fn print_gguf_tensor_info(&self, tensor_info: &[GgufTensorInfo], first_k: usize, tensor_count: u64) -> anyhow::Result<()> {
+        let first_k_to_show = first_k.min(tensor_info.len());
+        println!("📦 Tensors (first {} of {}):", first_k_to_show, tensor_count);
         println!("─────────────────────────────────");
-        for i in 0..first_k {
-            let name = self.read_gguf_string(cursor)?;
-            let n_dims = self.read_gguf_int32(cursor)?;
-            let mut shapes: Vec<GgufValue> = vec![];
-            for _ in 0..n_dims {
-                let shape = self.read_gguf_int64(cursor)?;
-                shapes.push(GgufValue::Int64(shape));
-            }
-
-            let ggml_type = self.read_gguf_int32(cursor)?;
-            let offset = self.read_gguf_int64(cursor)?;
-            println!("[{}] {} | n_dims: {} | shape: {} | type: {} | offset: {:#x}",
-                 i, name, n_dims, GgufValue::Array(shapes), ggml_type, offset);     
+        for i in 0..first_k_to_show {
+            println!("[{}] {} | n_dims: {} | shape: {:?} | type: {} | offset: {:#x}",
+                 i, 
+                 tensor_info[i].name, 
+                 tensor_info[i].n_dims, 
+                 tensor_info[i].shapes, 
+                 tensor_info[i].ggml_type, 
+                 tensor_info[i].offset
+                );     
         }
         println!("─────────────────────────────────");
 
@@ -214,5 +241,19 @@ impl Loader {
         };
 
         anyhow::Ok(())
+    }
+
+    fn get_byte_alignment(&self, kv_meta: &[GgufKVMeta]) -> i64 {
+        let alignment = kv_meta.iter()
+            .find(|&entry| entry.key == "general.alignment")
+            .and_then(|f| f.value.as_i64())
+            .unwrap_or(32);
+        alignment
+    }
+
+    fn get_pos_with_byte_alignment(&self, cursor: &mut Cursor<&[u8]>, alignment: i64) -> i64 {
+        let current_pos = cursor.position() as i64;
+        let aligned_pos = (current_pos + (alignment - 1)) & !(alignment - 1);
+        aligned_pos
     }
 }

@@ -41,9 +41,48 @@ impl fmt::Display for GgufType {
     }
 }
 
+#[derive(FromPrimitive)]
+pub enum GgmlType {
+    F32 = 0,
+    F16  = 1,
+    Q40 = 2,
+    Q41 = 3,
+    Q50 = 6,
+    Q51 = 7,
+    Q80 = 8,
+    Q81 = 9,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    Q8K = 15,
+    Iq2Xxs = 16,
+    Iq2Xs = 17,
+    Iq3Xxs = 18,
+    Iq1S = 19,
+    Iq4Nl = 20,
+    Iq3S = 21,
+    Iq2S = 22,
+    Iq4Xs = 23,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
+    Iq1M = 29,
+    Bf16 = 30,
+    Tq10 = 34,
+    Tq20 = 35,
+    Mxfp4 = 39,
+    Count = 40,
+}
+
 pub struct GgufInfo {
     pub headers: GgufHeaders,
     pub kv_meta: Vec<GgufKVMeta>,
+    pub tensor_info: Vec<GgufTensorInfo>,
+    pub tensor_offset_start: i64,
 }
 
 pub struct GgufHeaders {
@@ -60,7 +99,15 @@ pub struct GgufKVMeta {
     pub value: GgufValue,
 }
 
-#[derive(Debug)]
+pub struct GgufTensorInfo {
+    pub name: String,
+    pub n_dims: i32,
+    pub shapes: Vec<i64>,
+    pub ggml_type: i32,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone)]
 pub enum GgufValue {
     Uint8(u8),
     Int8(i8),
@@ -98,6 +145,16 @@ impl GgufValue {
             GgufValue::Uint8(v) => Some(*v as u32),
             GgufValue::Uint16(v) => Some(*v as u32),
             GgufValue::Uint32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            GgufValue::Uint8(v) => Some(*v as i64),
+            GgufValue::Uint16(v) => Some(*v as i64),
+            GgufValue::Uint32(v) => Some(*v as i64),
+            GgufValue::Int32(v) => Some(*v as i64),
             _ => None,
         }
     }
