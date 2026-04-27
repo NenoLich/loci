@@ -1,6 +1,6 @@
 use num_derive::FromPrimitive;
-use std::fmt;
 use std::convert::From;
+use std::fmt;
 
 // GGUF Value Types
 #[derive(FromPrimitive)]
@@ -44,7 +44,7 @@ impl fmt::Display for GgufType {
 #[derive(FromPrimitive)]
 pub enum GgmlType {
     F32 = 0,
-    F16  = 1,
+    F16 = 1,
     Q40 = 2,
     Q41 = 3,
     Q50 = 6,
@@ -118,7 +118,7 @@ pub enum GgufValue {
     Float32(f32),
     Bool(bool),
     String(String),
-    Array(Vec<GgufValue>), 
+    Array(Vec<GgufValue>),
     Uint64(u64),
     Int64(i64),
     Float64(f64),
@@ -135,15 +135,39 @@ impl fmt::Display for GgufValue {
             };
         }
 
-        display_value!(Uint8, Int8, Uint16, Int16, Uint32, Int32, Float32, Bool, String, Uint64, Int64, Float64)
+        display_value!(
+            Uint8, Int8, Uint16, Int16, Uint32, Int32, Float32, Bool, String, Uint64, Int64,
+            Float64
+        )
     }
 }
 
 impl GgufValue {
+    pub fn as_usize(&self) -> Option<usize> {
+        match self {
+            GgufValue::Uint8(v) => usize::try_from(*v).ok(),
+            GgufValue::Uint16(v) => usize::try_from(*v).ok(),
+            GgufValue::Uint32(v) => usize::try_from(*v).ok(),
+            GgufValue::Int16(v) => usize::try_from(*v).ok(),
+            GgufValue::Int32(v) => usize::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            GgufValue::Uint8(v) => f32::try_from(*v).ok(),
+            GgufValue::Uint16(v) => f32::try_from(*v).ok(),
+            GgufValue::Int16(v) => f32::try_from(*v).ok(),
+            GgufValue::Float32(v) => f32::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
     pub fn as_u32(&self) -> Option<u32> {
         match self {
-            GgufValue::Uint8(v) => Some(*v as u32),
-            GgufValue::Uint16(v) => Some(*v as u32),
+            GgufValue::Uint8(v) => u32::try_from(*v).ok(),
+            GgufValue::Uint16(v) => u32::try_from(*v).ok(),
             GgufValue::Uint32(v) => Some(*v),
             _ => None,
         }
@@ -151,10 +175,10 @@ impl GgufValue {
 
     pub fn as_i64(&self) -> Option<i64> {
         match self {
-            GgufValue::Uint8(v) => Some(*v as i64),
-            GgufValue::Uint16(v) => Some(*v as i64),
-            GgufValue::Uint32(v) => Some(*v as i64),
-            GgufValue::Int32(v) => Some(*v as i64),
+            GgufValue::Uint8(v) => i64::try_from(*v).ok(),
+            GgufValue::Uint16(v) => i64::try_from(*v).ok(),
+            GgufValue::Uint32(v) => i64::try_from(*v).ok(),
+            GgufValue::Int32(v) => i64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -208,31 +232,33 @@ impl From<&[GgufKVMeta]> for GGUFTokenizerConfig {
 
         for kv_meta in metadata {
             match kv_meta.key.as_str() {
-                "tokenizer.ggml.hf_json" => 
-                    json_config = kv_meta.value.as_string(),
-                "tokenizer.ggml.model" => 
-                    model_type = kv_meta.value.as_string(),
-                "tokenizer.ggml.tokens" => 
-                    tokens = kv_meta.value.as_slice()
-                        .and_then(|slice| {
-                            slice.iter()
-                                .filter_map(|v:&GgufValue| v.as_string().map(Some))
-                                .collect::<Option<Vec<String>>>()
-                        }),
-                "tokenizer.ggml.merges" => 
-                    merges = kv_meta.value.as_slice()
-                        .and_then(|slice| {
-                            slice.iter()
-                                .filter_map(|v:&GgufValue| v.as_string().map(Some))
-                                .collect::<Option<Vec<String>>>()
-                        }),
+                "tokenizer.ggml.hf_json" => json_config = kv_meta.value.as_string(),
+                "tokenizer.ggml.model" => model_type = kv_meta.value.as_string(),
+                "tokenizer.ggml.tokens" => {
+                    tokens = kv_meta.value.as_slice().and_then(|slice| {
+                        slice
+                            .iter()
+                            .filter_map(|v: &GgufValue| v.as_string().map(Some))
+                            .collect::<Option<Vec<String>>>()
+                    })
+                }
+                "tokenizer.ggml.merges" => {
+                    merges = kv_meta.value.as_slice().and_then(|slice| {
+                        slice
+                            .iter()
+                            .filter_map(|v: &GgufValue| v.as_string().map(Some))
+                            .collect::<Option<Vec<String>>>()
+                    })
+                }
                 "tokenizer.ggml.bos_token_id" => bos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.eos_token_id" => eos_token_id = kv_meta.value.as_u32(),
-                "tokenizer.ggml.add_bos_token" => 
-                    add_bos = kv_meta.value.as_bool().is_some_and(|v| v),
-                "tokenizer.ggml.add_eos_token" => 
-                    add_eos = kv_meta.value.as_bool().is_some_and(|v| v),
-                _ => {},
+                "tokenizer.ggml.add_bos_token" => {
+                    add_bos = kv_meta.value.as_bool().is_some_and(|v| v)
+                }
+                "tokenizer.ggml.add_eos_token" => {
+                    add_eos = kv_meta.value.as_bool().is_some_and(|v| v)
+                }
+                _ => {}
             }
         }
 

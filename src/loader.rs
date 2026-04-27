@@ -1,16 +1,21 @@
+use crate::gguf_types::{GgufHeaders, GgufInfo, GgufKVMeta, GgufTensorInfo, GgufType, GgufValue};
 use byteorder::{LittleEndian, ReadBytesExt};
 use memmap2::{Mmap, MmapOptions};
-use std::fs::File;
-use std::path::Path;
-use std::io::{Cursor, Read, Seek};
-use crate::gguf_types::{GgufHeaders, GgufType, GgufValue, GgufKVMeta, GgufInfo, GgufTensorInfo};
 use num_traits::FromPrimitive;
+use std::fs::File;
 use std::io::SeekFrom;
+use std::io::{Cursor, Read, Seek};
+use std::path::Path;
 
 pub struct Loader;
 
 impl Loader {
-    pub fn load_gguf_info(&self, path: impl AsRef<Path>, first_k_tensors: usize, verbose: bool) -> anyhow::Result<GgufInfo> {
+    pub fn load_gguf_info(
+        &self,
+        path: impl AsRef<Path>,
+        first_k_tensors: usize,
+        verbose: bool,
+    ) -> anyhow::Result<GgufInfo> {
         let file = File::open(&path)?;
         let mmap: Mmap = unsafe { MmapOptions::new().map(&file)? };
         let mut cursor = Cursor::new(&mmap[..]);
@@ -25,13 +30,13 @@ impl Loader {
         let version = cursor.read_u32::<LittleEndian>()?;
         let tensor_count = cursor.read_u64::<LittleEndian>()?;
         let metadata_kv_count = cursor.read_u64::<LittleEndian>()?;
-        
+
         let gguf_headers = GgufHeaders {
             path: path.as_ref().to_string_lossy().into_owned(),
             magic: String::from_utf8_lossy(&magic).into_owned(),
-            version, 
-            tensor_count, 
-            metadata_kv_count
+            version,
+            tensor_count,
+            metadata_kv_count,
         };
 
         // 2. Load Metadata
@@ -42,7 +47,11 @@ impl Loader {
             let value_type = self.read_gguf_type(&mut cursor)?;
             let value = self.get_gguf_value(&mut cursor, &value_type)?;
 
-            gguf_kv_meta_vec.push(GgufKVMeta {key, value_type, value});
+            gguf_kv_meta_vec.push(GgufKVMeta {
+                key,
+                value_type,
+                value,
+            });
         }
 
         // 3. Load Tensor info
@@ -60,7 +69,13 @@ impl Loader {
 
             let ggml_type = self.read_gguf_int32(&mut cursor)?;
             let offset = self.read_gguf_int64(&mut cursor)?;
-            gguf_tensor_info.push(GgufTensorInfo {name, n_dims, shapes, ggml_type, offset});
+            gguf_tensor_info.push(GgufTensorInfo {
+                name,
+                n_dims,
+                shapes,
+                ggml_type,
+                offset,
+            });
         }
 
         // 4. Get the tensor offset start
@@ -70,16 +85,20 @@ impl Loader {
         if verbose {
             self.print_gguf_headers(&gguf_headers);
             self.print_gguf_kv_meta(&gguf_kv_meta_vec);
-            self.print_gguf_tensor_info(&gguf_tensor_info, first_k_tensors, gguf_headers.tensor_count)?;
+            self.print_gguf_tensor_info(
+                &gguf_tensor_info,
+                first_k_tensors,
+                gguf_headers.tensor_count,
+            )?;
         }
 
         let gguf_info = GgufInfo {
-            headers: gguf_headers, 
-            kv_meta: gguf_kv_meta_vec, 
-            tensor_info: gguf_tensor_info, 
-            tensor_offset_start: gguf_tensor_offset_start
+            headers: gguf_headers,
+            kv_meta: gguf_kv_meta_vec,
+            tensor_info: gguf_tensor_info,
+            tensor_offset_start: gguf_tensor_offset_start,
         };
-        
+
         anyhow::Ok(gguf_info)
     }
 
@@ -99,28 +118,40 @@ impl Loader {
         println!("\n📋 Metadata:");
         println!("─────────────────────────────────");
         for entry in kv_meta {
-            if !matches!(entry.value.as_slice(), Some(array) if array.len() >= 16) {
+            if !matches!(entry.value.as_slice(), Some(array) if array.len() > 16) {
                 println!("{}: {} = {}", entry.key, entry.value_type, entry.value);
             } else {
-                println!("{}: {} = [MORE THEN 16 ENTRIES]", entry.key, entry.value_type);
-            }  
+                println!(
+                    "{}: {} = [MORE THEN 16 ENTRIES]",
+                    entry.key, entry.value_type
+                );
+            }
         }
         println!("─────────────────────────────────");
     }
 
-    fn print_gguf_tensor_info(&self, tensor_info: &[GgufTensorInfo], first_k: usize, tensor_count: u64) -> anyhow::Result<()> {
+    fn print_gguf_tensor_info(
+        &self,
+        tensor_info: &[GgufTensorInfo],
+        first_k: usize,
+        tensor_count: u64,
+    ) -> anyhow::Result<()> {
         let first_k_to_show = first_k.min(tensor_info.len());
-        println!("📦 Tensors (first {} of {}):", first_k_to_show, tensor_count);
+        println!(
+            "📦 Tensors (first {} of {}):",
+            first_k_to_show, tensor_count
+        );
         println!("─────────────────────────────────");
         for i in 0..first_k_to_show {
-            println!("[{}] {} | n_dims: {} | shape: {:?} | type: {} | offset: {:#x}",
-                 i, 
-                 tensor_info[i].name, 
-                 tensor_info[i].n_dims, 
-                 tensor_info[i].shapes, 
-                 tensor_info[i].ggml_type, 
-                 tensor_info[i].offset
-                );     
+            println!(
+                "[{}] {} | n_dims: {} | shape: {:?} | type: {} | offset: {:#x}",
+                i,
+                tensor_info[i].name,
+                tensor_info[i].n_dims,
+                tensor_info[i].shapes,
+                tensor_info[i].ggml_type,
+                tensor_info[i].offset
+            );
         }
         println!("─────────────────────────────────");
 
@@ -197,36 +228,48 @@ impl Loader {
             .ok_or_else(|| anyhow::anyhow!("Unknown GGUF type ID: {}", gguf_type_n))
     }
 
-    fn get_gguf_value(&self, cursor: &mut Cursor<&[u8]>, value_type: &GgufType) -> anyhow::Result<GgufValue> {
+    fn get_gguf_value(
+        &self,
+        cursor: &mut Cursor<&[u8]>,
+        value_type: &GgufType,
+    ) -> anyhow::Result<GgufValue> {
         let value = match value_type {
-                GgufType::Uint8 => GgufValue::Uint8(self.read_gguf_uint8(cursor)?),
-                GgufType::Int8 => GgufValue::Int8(self.read_gguf_int8(cursor)?),
-                GgufType::Uint16 => GgufValue::Uint16(self.read_gguf_uint16(cursor)?),
-                GgufType::Int16 => GgufValue::Int16(self.read_gguf_int16(cursor)?),
-                GgufType::Uint32 => GgufValue::Uint32(self.read_gguf_uint32(cursor)?),
-                GgufType::Int32 => GgufValue::Int32(self.read_gguf_int32(cursor)?),
-                GgufType::Float32 => GgufValue::Float32(self.read_gguf_float32(cursor)?),
-                GgufType::Bool => GgufValue::Bool(self.read_gguf_bool(cursor)?),
-                GgufType::String => GgufValue::String(self.read_gguf_string(cursor)?),
-                GgufType::Array => GgufValue::Array(self.read_gguf_array(cursor)?),
-                GgufType::Uint64 => GgufValue::Uint64(self.read_gguf_uint64(cursor)?),
-                GgufType::Int64 => GgufValue::Int64(self.read_gguf_int64(cursor)?),
-                GgufType::Float64 => GgufValue::Float64(self.read_gguf_float64(cursor)?),
-            };
+            GgufType::Uint8 => GgufValue::Uint8(self.read_gguf_uint8(cursor)?),
+            GgufType::Int8 => GgufValue::Int8(self.read_gguf_int8(cursor)?),
+            GgufType::Uint16 => GgufValue::Uint16(self.read_gguf_uint16(cursor)?),
+            GgufType::Int16 => GgufValue::Int16(self.read_gguf_int16(cursor)?),
+            GgufType::Uint32 => GgufValue::Uint32(self.read_gguf_uint32(cursor)?),
+            GgufType::Int32 => GgufValue::Int32(self.read_gguf_int32(cursor)?),
+            GgufType::Float32 => GgufValue::Float32(self.read_gguf_float32(cursor)?),
+            GgufType::Bool => GgufValue::Bool(self.read_gguf_bool(cursor)?),
+            GgufType::String => GgufValue::String(self.read_gguf_string(cursor)?),
+            GgufType::Array => GgufValue::Array(self.read_gguf_array(cursor)?),
+            GgufType::Uint64 => GgufValue::Uint64(self.read_gguf_uint64(cursor)?),
+            GgufType::Int64 => GgufValue::Int64(self.read_gguf_int64(cursor)?),
+            GgufType::Float64 => GgufValue::Float64(self.read_gguf_float64(cursor)?),
+        };
 
         anyhow::Ok(value)
     }
 
-    fn skip_gguf_value(&self, cursor: &mut Cursor<&[u8]>, value_type: &GgufType) -> anyhow::Result<()> {
+    fn skip_gguf_value(
+        &self,
+        cursor: &mut Cursor<&[u8]>,
+        value_type: &GgufType,
+    ) -> anyhow::Result<()> {
         match value_type {
-            GgufType::Uint8 | GgufType::Int8 | GgufType::Bool => 
-                { cursor.seek(SeekFrom::Current(1))?; }
-            GgufType::Uint16 | GgufType::Int16 => 
-                { cursor.seek(SeekFrom::Current(2))?; }
-            GgufType::Uint32 | GgufType::Int32 | GgufType::Float32 => 
-                { cursor.seek(SeekFrom::Current(4))?; }
-            GgufType::Uint64 | GgufType::Int64 | GgufType::Float64 => 
-                { cursor.seek(SeekFrom::Current(8))?; }
+            GgufType::Uint8 | GgufType::Int8 | GgufType::Bool => {
+                cursor.seek(SeekFrom::Current(1))?;
+            }
+            GgufType::Uint16 | GgufType::Int16 => {
+                cursor.seek(SeekFrom::Current(2))?;
+            }
+            GgufType::Uint32 | GgufType::Int32 | GgufType::Float32 => {
+                cursor.seek(SeekFrom::Current(4))?;
+            }
+            GgufType::Uint64 | GgufType::Int64 | GgufType::Float64 => {
+                cursor.seek(SeekFrom::Current(8))?;
+            }
             GgufType::String => {
                 let len = cursor.read_u64::<LittleEndian>()?;
                 cursor.seek(SeekFrom::Current(len as i64))?;
@@ -244,7 +287,8 @@ impl Loader {
     }
 
     fn get_byte_alignment(&self, kv_meta: &[GgufKVMeta]) -> i64 {
-        let alignment = kv_meta.iter()
+        let alignment = kv_meta
+            .iter()
             .find(|&entry| entry.key == "general.alignment")
             .and_then(|f| f.value.as_i64())
             .unwrap_or(32);
