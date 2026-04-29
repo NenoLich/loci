@@ -48,7 +48,6 @@ impl Lfm2Layer {
         compute_dtype: DType,
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
-        let pre_mixer_residual = input.clone();
         let x = self.attn_norm.forward(&input.to_dtype(DType::F32)?)?;  
         let mixed = match &self.mixer {
             Lfm2Mixer::Attention(attn_mixer) => attn_mixer.forward(
@@ -65,10 +64,9 @@ impl Lfm2Layer {
             Lfm2Mixer::ShortConv(conv_mixer) => conv_mixer.forward(&x, cache, compute_dtype)?,
         };
         
-        let x = (mixed + pre_mixer_residual)?;
+        let pre_mlp_residual = (mixed + input)?;
  
-        let pre_mlp_residual = x.clone();
-        let x = self.ffn_norm.forward(&x.to_dtype(DType::F32)?)?;
+        let x = self.ffn_norm.forward(&pre_mlp_residual.to_dtype(DType::F32)?)?;
         
         let x = self.ffn.forward(&x.to_dtype(compute_dtype)?)?;
         
@@ -275,8 +273,7 @@ impl ShortConvMixer {
         let in_proj = self.in_proj.forward(&input.to_dtype(compute_dtype)?)?;
 
         // 2. Split into 3 chunks of 1024
-        let chunks = in_proj.chunk(3, 2)?;
-        let (b_gate, c_gate, h_signal) = (chunks[0].clone(), chunks[1].clone(), chunks[2].clone());
+        let [b_gate, c_gate, h_signal] = in_proj.chunk(3, 2)?.try_into().unwrap();
 
         // 3. First Gating: y = B ⊙ h˜
         let y = (b_gate * h_signal)?; 
