@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use std::io::Write;
 
 use crate::error::LociError;
-use crate::gguf_types::{GGUFTokenizerConfig, GgufKVMeta};
+use crate::gguf::{GGUFTokenizerConfig, GgufKVMeta};
 
 use tokenizers::Encoding;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
@@ -49,14 +49,6 @@ impl TokenizerService {
         self.tokenizer
             .decode(tokens, true)
             .map_err(|e| LociError::Tokenization { source: e })
-    }
-
-    pub fn set_bos_token_id(&mut self, bos_token_id: u32) {
-        self.bos_token_id = bos_token_id;
-    }
-
-    pub fn set_eos_token_id(&mut self, eos_token_id: u32) {
-        self.eos_token_id = eos_token_id;
     }
 
     pub fn eos_token_id(&self) -> u32 {

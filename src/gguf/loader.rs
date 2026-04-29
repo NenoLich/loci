@@ -1,4 +1,4 @@
-use crate::gguf_types::{GgufHeaders, GgufInfo, GgufKVMeta, GgufTensorInfo, GgufType, GgufValue};
+use crate::gguf::{GgufHeaders, GgufInfo, GgufKVMeta, GgufTensorInfo, GgufType, GgufValue};
 use crate::error::{LociContext, LociError};
 use byteorder::{LittleEndian, ReadBytesExt};
 use memmap2::{Mmap, MmapOptions};
@@ -70,7 +70,7 @@ impl Loader {
             let value = Self::get_gguf_value(&mut cursor, &value_type).map_err(|e| {
                 LociError::InvalidFileMetadata {
                     file_type: "GGUF".into(),
-                    field: format!("metadata value for key '{}'", key).into(),
+                    field: format!("metadata value for key '{}'", key),
                     offset: position,
                     source: Box::new(e),
                 }
@@ -91,7 +91,7 @@ impl Loader {
             let n_dims = Self::read_gguf_int32(&mut cursor).map_err(|e| {
                 LociError::InvalidFileMetadata {
                     file_type: "GGUF".into(),
-                    field: format!("tensor '{}' n_dims", name).into(),
+                    field: format!("tensor '{}' n_dims", name),
                     offset: cursor.position(),
                     source: Box::new(e),
                 }
@@ -101,7 +101,7 @@ impl Loader {
                 let shape = Self::read_gguf_int64(&mut cursor).map_err(|e| {
                     LociError::InvalidFileMetadata {
                         file_type: "GGUF".into(),
-                        field: format!("tensor '{}' shape", name).into(),
+                        field: format!("tensor '{}' shape", name),
                         offset: cursor.position(),
                         source: Box::new(e),
                     }
@@ -112,7 +112,7 @@ impl Loader {
             let ggml_type = Self::read_gguf_int32(&mut cursor).map_err(|e| {
                 LociError::InvalidFileMetadata {
                     file_type: "GGUF".into(),
-                    field: format!("tensor '{}' ggml_type", name).into(),
+                    field: format!("tensor '{}' ggml_type", name),
                     offset: cursor.position(),
                     source: Box::new(e),
                 }
@@ -120,7 +120,7 @@ impl Loader {
             let offset = Self::read_gguf_int64(&mut cursor).map_err(|e| {
                 LociError::InvalidFileMetadata {
                     file_type: "GGUF".into(),
-                    field: format!("tensor '{}' offset", name).into(),
+                    field: format!("tensor '{}' offset", name),
                     offset: cursor.position(),
                     source: Box::new(e),
                 }
@@ -183,11 +183,11 @@ impl Loader {
         let first_k_to_show = first_k.min(tensor_info.len());
         println!("Tensors (first {} of {}):", first_k_to_show, tensor_count);
         println!("─────────────────────────────────");
-        for i in 0..first_k_to_show {
+        for (i, item) in tensor_info.iter().enumerate().take(first_k_to_show) {
             println!(
                 "[{}] {} | n_dims: {} | shape: {:?} | type: {} | offset: {:#x}",
-                i, tensor_info[i].name, tensor_info[i].n_dims,
-                tensor_info[i].shapes, tensor_info[i].ggml_type, tensor_info[i].offset
+                i, item.name, item.n_dims,
+                item.shapes, item.ggml_type, item.offset
             );
         }
         println!("─────────────────────────────────");

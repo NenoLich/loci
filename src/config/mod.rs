@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::gguf_types::{GgufInfo, GgufKVMeta, GgufValue};
+use crate::gguf::{GgufInfo, GgufKVMeta, GgufValue};
 
 #[derive(Debug, Clone)]
 pub enum ModelArchitecture {

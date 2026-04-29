@@ -2,22 +2,20 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 #[cfg(feature = "cuda")]
 use candle_flash_attn::flash_attn;
-use candle_nn::kv_cache::{self, ConcatKvCache};
+use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::{
     Linear, Embedding,
     Conv1d, Conv1dConfig, Module,
     ops::{silu, softmax},
 };
-use candle_transformers::models::with_tracing::QMatMul;
-use candle_transformers::quantized_nn::{RmsNorm, linear_no_bias};
+use candle_transformers::quantized_nn::RmsNorm;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use once_cell::sync::OnceCell;
-use std::env::var;
 use std::rc::Rc;
 
 use crate::{
-    model::{Model, model::MixedCache},
-    model_config::ModelConfig,
+    model::{Model, MixedCache},
+    config::ModelConfig,
 };
 
 pub struct Lfm2Model {
@@ -33,10 +31,6 @@ pub struct Lfm2Layer {
     pub mixer: Lfm2Mixer,   // The "Motor": either Attention or Conv
     pub ffn_norm: RmsNorm,  // blk.N.ffn_norm.weight
     pub ffn: Lfm2Ffn,       // gate, up, and down projections
-    pub hidden_size: usize,
-    pub n_heads: usize,
-    pub n_kv_heads: usize,
-    pub max_seq_len: usize,
 }
 
 impl Lfm2Layer {
@@ -48,16 +42,12 @@ impl Lfm2Layer {
         compute_dtype: DType,
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
-        let x = self.attn_norm.forward(&input.to_dtype(DType::F32)?)?;  
+        let x = self.attn_norm.forward(&input.to_dtype(DType::F32)?)?;
         let mixed = match &self.mixer {
             Lfm2Mixer::Attention(attn_mixer) => attn_mixer.forward(
                 &x,
                 cache,
                 pos,
-                self.hidden_size,
-                self.n_heads,
-                self.n_kv_heads,
-                self.max_seq_len,
                 compute_dtype,
                 use_flash,
             )?,
@@ -90,6 +80,10 @@ pub struct AttentionMixer {
     k_norm: RmsNorm, // blk.N.attn_k_norm
     mask_indices: OnceCell<Tensor>,
     rope: Rc<RotaryEmbedding>,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq_len: usize,
 }
 
 impl AttentionMixer {
@@ -98,14 +92,9 @@ impl AttentionMixer {
         x: &Tensor,
         cache: &mut Option<MixedCache>,
         pos: usize,
-        hidden_size: usize,
-        n_heads: usize,
-        n_kv_heads: usize,
-        max_seq_len: usize,
         compute_dtype: DType,
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
-        let head_dim = hidden_size / n_heads;
         let x = x.to_dtype(compute_dtype)?;
         // Proj forward pass
         let q = self.q_proj.forward(&x)?;
@@ -116,19 +105,19 @@ impl AttentionMixer {
         let (b, s, _) = q.dims3()?;
 
         let q = q
-            .reshape((b, s, n_heads, head_dim))?
+            .reshape((b, s, self.n_heads, self.head_dim))?
             .permute((0, 2, 1, 3))?;
         let k = k
-            .reshape((b, s, n_kv_heads, head_dim))?
+            .reshape((b, s, self.n_kv_heads, self.head_dim))?
             .permute((0, 2, 1, 3))?;
         let v = v
-            .reshape((b, s, n_kv_heads, head_dim))?
+            .reshape((b, s, self.n_kv_heads, self.head_dim))?
             .permute((0, 2, 1, 3))?;
 
         // 1. Apply RoPE (Rotary Position Embeddings)
         let q = self.rope.forward(&q, pos)?;
         let k = self.rope.forward(&k, pos)?;
-        
+
         // 2. Apply QK-Norm (LFM2 specific)
         let q = self.q_norm.forward(&q.to_dtype(DType::F32)?)?;
         let k = self.k_norm.forward(&k.to_dtype(DType::F32)?)?;
@@ -148,16 +137,12 @@ impl AttentionMixer {
             q,
             k,
             v,
-            max_seq_len,
-            n_heads,
-            n_kv_heads,
-            head_dim,
             compute_dtype,
             use_flash,
         )?;
 
         // Flatten: [B, S, H, D] -> [B, S, H * D]
-        let y = y.reshape((b, s, hidden_size))?;
+        let y = y.reshape((b, s, self.head_dim * self.n_heads))?;
         anyhow::Ok(self.o_proj.forward(&y)?)
     }
 
@@ -166,18 +151,14 @@ impl AttentionMixer {
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        max_seq_len: usize,
-        n_heads: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
         compute_dtype: DType,
-        use_flash: bool,
+        _use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         // Scores Q @ K.T) / sqrt(head_dim)
-        let scale = 1.0 / (head_dim as f64).sqrt(); 
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
 
         #[cfg(feature = "cuda")]
-        if use_flash && q.device().is_cuda() {
+        if _use_flash && q.device().is_cuda() {
             // Flash attention expects [Batch, Seq, Heads, Head_Dim]
             // Note: LFM2 usually needs a transpose to put heads in the 3rd slot
 
@@ -193,13 +174,13 @@ impl AttentionMixer {
         // Grouped-Query Attention in F32
         let (_b, _h, q_s, _d) = q.dims4()?;
 
-        let k = crate::model::utility::repeat_kv(k, n_heads / n_kv_heads)?.to_dtype(DType::F32)?;
-        let v = crate::model::utility::repeat_kv(v, n_heads / n_kv_heads)?.to_dtype(DType::F32)?;
+        let k = crate::model::utility::repeat_kv(k, self.n_heads / self.n_kv_heads)?.to_dtype(DType::F32)?;
+        let v = crate::model::utility::repeat_kv(v, self.n_heads / self.n_kv_heads)?.to_dtype(DType::F32)?;
 
         let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
         let attn = if q_s > 1 {
-            let mask = self.get_mask(q_s, max_seq_len, compute_dtype, q.device())?;
+            let mask = self.get_mask(q_s, self.max_seq_len, compute_dtype, q.device())?;
             let attn = attn.to_dtype(compute_dtype)?;
             attn.broadcast_add(&mask)?.to_dtype(DType::F32)?
         } else {
@@ -284,7 +265,7 @@ impl ShortConvMixer {
         // 4. Add cache or padding if needed and perform conv forward
         let conv_out = if seq_len == 1 {
             if let Some(MixedCache::ConvCache(state)) = cache {
-                let y_cached = Tensor::cat(&[state.as_ref(), &y_t], 2)?;
+                let y_cached = Tensor::cat(&[&*state, &y_t], 2)?;
                 let s_current = y_cached.dims()[2];
                 let y_narrowed =
                     y_cached.narrow(2, s_current - self.conv_l_cache, self.conv_l_cache)?;
@@ -349,7 +330,7 @@ impl Lfm2Ffn {
 
         // 2. Activation in F32 for stability
         let gate_f32 = gate_proj.to_dtype(DType::F32)?;
-        let activated = candle_nn::ops::silu(&gate_f32)?;
+        let activated = silu(&gate_f32)?;
         
         // 3. Multiply and cast back to compute_dtype
         let x = (activated.to_dtype(self.compute_dtype)? * up_proj)?;
@@ -368,8 +349,7 @@ impl Model for Lfm2Model {
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         // 1. Embeddings
-        let mut x = input.to_dtype(self.compute_dtype)?;
-        x = self.embed_layer.forward(input)?;
+        let mut x = self.embed_layer.forward(&input)?;
 
         // 2. Attention and conv layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -403,10 +383,8 @@ impl Lfm2Model {
     pub fn load(config: ModelConfig, var_builder: VarBuilder, compute_dtype: DType) -> anyhow::Result<Self> {
         let rms_epsilon = config.rms_epsilon as f64;
         let hidden_size = config.hidden_size;
-        let vocab_size = config.vocab_size;
         let n_layers = config.n_layers;
         let n_heads = config.n_heads;
-        let intermediate_ffn_size = config.intermediate_ffn_size;
         let max_seq_len = config.max_seq_len;
         let head_dim = hidden_size / n_heads;
         let device = var_builder.device();
@@ -451,40 +429,43 @@ impl Lfm2Model {
 
             // 2. Mixer of attention or shortconv
             let mixer = if n_kv_heads > 0 {
-                let kv_proj_out_dim = (n_kv_heads * hidden_size) / n_heads;
                 let attn_mixer = AttentionMixer {
                     q_proj: Linear::new(
                         Self::get_tensor(
-                            "attn_q.weight", 
-                            vb_l.clone(), 
+                            "attn_q.weight",
+                            vb_l.clone(),
                             compute_dtype
-                        )?, 
+                        )?,
                         None),
                     k_proj: Linear::new(
                         Self::get_tensor(
-                            "attn_k.weight", 
-                            vb_l.clone(), 
+                            "attn_k.weight",
+                            vb_l.clone(),
                             compute_dtype
-                        )?, 
+                        )?,
                         None),
                     v_proj: Linear::new(
                         Self::get_tensor(
-                            "attn_v.weight", 
-                            vb_l.clone(), 
+                            "attn_v.weight",
+                            vb_l.clone(),
                             compute_dtype
-                        )?, 
+                        )?,
                         None),
                     o_proj: Linear::new(
                         Self::get_tensor(
-                            "attn_output.weight", 
-                            vb_l.clone(), 
+                            "attn_output.weight",
+                            vb_l.clone(),
                             compute_dtype
-                        )?, 
-                        None), 
+                        )?,
+                        None),
                     q_norm: RmsNorm::new(head_dim, rms_epsilon, vb_l.pp("attn_q_norm"))?,
                     k_norm: RmsNorm::new(head_dim, rms_epsilon, vb_l.pp("attn_k_norm"))?,
                     rope: rope.clone(),
                     mask_indices: OnceCell::new(),
+                    head_dim,
+                    n_heads,
+                    n_kv_heads,
+                    max_seq_len,
                 };
                 Lfm2Mixer::Attention(attn_mixer)
             } else {
@@ -550,10 +531,6 @@ impl Lfm2Model {
                 mixer,
                 ffn_norm,
                 ffn,
-                hidden_size,
-                n_heads,
-                n_kv_heads,
-                max_seq_len,
             });
         }
 

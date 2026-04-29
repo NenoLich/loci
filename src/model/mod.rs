@@ -1,9 +1,13 @@
+mod lfm2_model;
+mod utility;
+
+pub use self::lfm2_model::Lfm2Model;
+
 use candle_core::{DType, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_transformers::quantized_var_builder::VarBuilder;
 
-use crate::model::Lfm2Model;
-use crate::model_config::{ModelArchitecture, ModelConfig};
+use crate::config::{ModelArchitecture, ModelConfig};
 
 pub trait Model {
     fn forward(

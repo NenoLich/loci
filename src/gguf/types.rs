@@ -145,8 +145,8 @@ impl fmt::Display for GgufValue {
 impl GgufValue {
     pub fn as_usize(&self) -> Option<usize> {
         match self {
-            GgufValue::Uint8(v) => usize::try_from(*v).ok(),
-            GgufValue::Uint16(v) => usize::try_from(*v).ok(),
+            GgufValue::Uint8(v) => Some(usize::from(*v)),
+            GgufValue::Uint16(v) => Some(usize::from(*v)),
             GgufValue::Uint32(v) => usize::try_from(*v).ok(),
             GgufValue::Int16(v) => usize::try_from(*v).ok(),
             GgufValue::Int32(v) => usize::try_from(*v).ok(),
@@ -156,18 +156,18 @@ impl GgufValue {
 
     pub fn as_f32(&self) -> Option<f32> {
         match self {
-            GgufValue::Uint8(v) => f32::try_from(*v).ok(),
-            GgufValue::Uint16(v) => f32::try_from(*v).ok(),
-            GgufValue::Int16(v) => f32::try_from(*v).ok(),
-            GgufValue::Float32(v) => f32::try_from(*v).ok(),
+            GgufValue::Uint8(v) => Some(f32::from(*v)),
+            GgufValue::Uint16(v) => Some(f32::from(*v)),
+            GgufValue::Int16(v) => Some(f32::from(*v)),
+            GgufValue::Float32(v) => Some(*v),
             _ => None,
         }
     }
 
     pub fn as_u32(&self) -> Option<u32> {
         match self {
-            GgufValue::Uint8(v) => u32::try_from(*v).ok(),
-            GgufValue::Uint16(v) => u32::try_from(*v).ok(),
+            GgufValue::Uint8(v) => Some(u32::from(*v)),
+            GgufValue::Uint16(v) => Some(u32::from(*v)),
             GgufValue::Uint32(v) => Some(*v),
             _ => None,
         }
@@ -175,10 +175,10 @@ impl GgufValue {
 
     pub fn as_i64(&self) -> Option<i64> {
         match self {
-            GgufValue::Uint8(v) => i64::try_from(*v).ok(),
-            GgufValue::Uint16(v) => i64::try_from(*v).ok(),
-            GgufValue::Uint32(v) => i64::try_from(*v).ok(),
-            GgufValue::Int32(v) => i64::try_from(*v).ok(),
+            GgufValue::Uint8(v) => Some(i64::from(*v)),
+            GgufValue::Uint16(v) => Some(i64::from(*v)),
+            GgufValue::Uint32(v) => Some(i64::from(*v)),
+            GgufValue::Int32(v) => Some(i64::from(*v)),
             _ => None,
         }
     }

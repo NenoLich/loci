@@ -2,15 +2,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::error::LociError;
-use crate::loader::Loader;
+use crate::gguf::Loader;
 use crate::model::{MixedCache, Model, ModelBuilder};
-use crate::model_config::ModelConfig;
+use crate::config::ModelConfig;
 use crate::tokenizer::{StreamState, TokenizerService, TokenizerServiceBuilder};
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use once_cell::sync::OnceCell;
-use tracing::{debug, info};
+use tracing::{debug};
 
 pub struct GenerationReport {
     pub text: String,
@@ -134,7 +134,7 @@ impl InferenceEngine {
         let prompt_tokens = encoding.get_ids();
 
         // Initialize logits processor (handles temperature, top-p, etc.)
-        let logits_processor = LogitsProcessor::new(19, Some(temperature), None);
+        let logits_processor = LogitsProcessor::new(18, Some(temperature), None);
 
         let model = self.model.get_or_try_init(|| self.init_model())?;
 
@@ -163,7 +163,7 @@ impl InferenceEngine {
             // After pre-fill, we only ever feed the 'next_token' back in
             context.advance(&[next_token]);
 
-            if let Some(output) = self.tokenizer.process_token(&mut stream_state, next_token.clone())? {
+            if let Some(output) = self.tokenizer.process_token(&mut stream_state, next_token)? {
                 callback(&output)?;
                 output_text.push_str(&output);
             }
