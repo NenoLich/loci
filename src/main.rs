@@ -5,6 +5,7 @@ mod gguf;
 mod model;
 mod tokenizer;
 mod inference;
+mod session;
 
 use tracing_subscriber::EnvFilter;
 
@@ -16,6 +17,6 @@ fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-
+        
     cli::run()
 }

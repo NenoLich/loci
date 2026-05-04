@@ -1,13 +1,9 @@
-mod lfm2_model;
-mod utility;
-
-pub use self::lfm2_model::Lfm2Model;
-
 use candle_core::{DType, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_transformers::quantized_var_builder::VarBuilder;
 
 use crate::config::{ModelArchitecture, ModelConfig};
+use crate::model::Lfm2Model;
 
 pub trait Model {
     fn forward(
@@ -29,21 +25,25 @@ pub struct ModelBuilder {
     pub config: ModelConfig,
     pub var_builder: VarBuilder,
     pub compute_dtype: DType,
+    pub max_seq_len: usize,
+    pub conv_on_cpu: bool,
 }
 
 impl ModelBuilder {
-    pub fn new(config: ModelConfig, var_builder: VarBuilder, compute_dtype: DType) -> Self {
+    pub fn new(config: ModelConfig, var_builder: VarBuilder, compute_dtype: DType, max_seq_len: usize, conv_on_cpu: bool) -> Self {
         Self {
             config,
             var_builder,
-            compute_dtype
+            compute_dtype,
+            max_seq_len,
+            conv_on_cpu,
         }
     }
 
     pub fn build(self) -> anyhow::Result<Box<dyn Model>> {
         match self.config.architecture {
             ModelArchitecture::Lfm2 => {
-                anyhow::Ok(Box::new(Lfm2Model::load(self.config, self.var_builder, self.compute_dtype)?))
+                anyhow::Ok(Box::new(Lfm2Model::load(self.config, self.var_builder, self.compute_dtype, self.max_seq_len, self.conv_on_cpu)?))
             }
             ModelArchitecture::Llama => anyhow::bail!("Not implemented yet"),
         }

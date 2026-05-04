@@ -213,6 +213,7 @@ pub struct GGUFTokenizerConfig {
     pub tokens: Option<Vec<String>>,
     pub merges: Option<Vec<String>>,
     pub json_config: Option<String>,
+    pub chat_template: Option<String>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     pub add_bos: bool,
@@ -225,6 +226,7 @@ impl From<&[GgufKVMeta]> for GGUFTokenizerConfig {
         let mut model_type = None;
         let mut tokens = None;
         let mut merges = None;
+        let mut chat_template = None;
         let mut bos_token_id = None;
         let mut eos_token_id = None;
         let mut add_bos = false;
@@ -250,6 +252,7 @@ impl From<&[GgufKVMeta]> for GGUFTokenizerConfig {
                             .collect::<Option<Vec<String>>>()
                     })
                 }
+                "tokenizer.chat_template" => chat_template = kv_meta.value.as_string(),
                 "tokenizer.ggml.bos_token_id" => bos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.eos_token_id" => eos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.add_bos_token" => {
@@ -263,10 +266,11 @@ impl From<&[GgufKVMeta]> for GGUFTokenizerConfig {
         }
 
         Self {
-            json_config,
             model_type,
             tokens,
             merges,
+            json_config,
+            chat_template,
             bos_token_id,
             eos_token_id,
             add_bos,
