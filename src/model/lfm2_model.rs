@@ -12,31 +12,61 @@ use nvtx::{range, range_push, range_pop};
 use candle_transformers::quantized_nn::RmsNorm;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use once_cell::sync::OnceCell;
-use std::{any, clone};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
-use rayon::prelude::*;
 
 use crate::{
     model::{Model, MixedCache},
     config::ModelConfig,
 };
 
+/// LFM2 transformer model implementation.
+///
+/// This model consists of token embeddings, a series of transformer layers
+/// (with mixed attention/convolution mixers), and an output head.
+/// It supports quantized weights and various compute dtypes (F16, BF16, F32).
 pub struct Lfm2Model {
-    pub embed_layer: Embedding, // token_embd.weight
-    pub embed_norm: RmsNorm,    // token_embd_norm.weight (LFM2 specific)
-    pub layers: Vec<Lfm2Layer>, // The 16 blocks
-    pub lm_head: Linear,        // output.weight
+    /// Token embedding layer (token_embd.weight)
+    pub embed_layer: Embedding,
+    /// Embedding normalization (token_embd_norm.weight) - LFM2 specific
+    pub embed_norm: RmsNorm,
+    /// Transformer layers (typically 16 blocks)
+    pub layers: Vec<Lfm2Layer>,
+    /// Output projection layer (output.weight)
+    pub lm_head: Linear,
+    /// Data type used for computations (F16, BF16, or F32)
     pub compute_dtype: DType,
 }
 
+/// A single transformer layer in the LFM2 model.
+///
+/// Each layer consists of:
+/// 1. An attention/convolution mixer (the "motor")
+/// 2. Feed-forward network (FFN) with SwiGLU activation
+/// 3. RMS normalization before attention and FFN
 pub struct Lfm2Layer {
-    pub attn_norm: RmsNorm, // blk.N.attn_norm.weight (ALWAYS exists)
-    pub mixer: Lfm2Mixer,   // The "Motor": either Attention or Conv
-    pub ffn_norm: RmsNorm,  // blk.N.ffn_norm.weight
-    pub ffn: Lfm2Ffn,       // gate, up, and down projections
+    /// Pre-attention normalization (blk.N.attn_norm.weight)
+    pub attn_norm: RmsNorm,
+    /// Mixed attention/convolution block (the "motor")
+    pub mixer: Lfm2Mixer,
+    /// Pre-FFN normalization (blk.N.ffn_norm.weight)
+    pub ffn_norm: RmsNorm,
+    /// Feed-forward network with gate, up, and down projections
+    pub ffn: Lfm2Ffn,
 }
 
 impl Lfm2Layer {
+    /// Forward pass through a single transformer layer.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor of shape [batch, seq_len, hidden_size]
+    /// * `cache` - KV cache or convolution cache for incremental decoding
+    /// * `pos` - Current position in the sequence (for RoPE)
+    /// * `compute_dtype` - Data type for computations
+    /// * `use_flash` - Whether to use flash attention (if available)
+    ///
+    /// # Returns
+    /// Output tensor of shape [batch, seq_len, hidden_size]
     fn forward(
         &self,
         input: &Tensor,
@@ -45,51 +75,83 @@ impl Lfm2Layer {
         compute_dtype: DType,
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
+        // 1. Attention/convolution mixer with pre-norm and residual
         let x = self.attn_norm.forward(&input.to_dtype(DType::F32)?)?;
         let mixed = match &self.mixer {
-            Lfm2Mixer::Attention(attn_mixer) => attn_mixer.forward(
-                &x,
-                cache,
-                pos,
-                compute_dtype,
-                use_flash,
-            )?,
-            Lfm2Mixer::ShortConv(conv_mixer) => conv_mixer.forward(&x, cache, compute_dtype)?,
+            Lfm2Mixer::Attention(attn_mixer) => {
+                attn_mixer.forward(&x, cache, pos, compute_dtype, use_flash)?
+            }
+            Lfm2Mixer::ShortConv(conv_mixer) => {
+                conv_mixer.forward(&x, cache, compute_dtype)?
+            }
         };
+        let attn_output = (mixed + input)?;
 
-        let pre_mlp_residual = (mixed + input)?;
- 
-        let x = self.ffn_norm.forward(&pre_mlp_residual.to_dtype(DType::F32)?)?;
-        
-        let x = self.ffn.forward(&x.to_dtype(compute_dtype)?)?;
-        
-        let output = (x + pre_mlp_residual)?;
+        // 2. FFN with pre-norm and residual
+        let x = self.ffn_norm.forward(&attn_output.to_dtype(DType::F32)?)?;
+        let ffn_output = self.ffn.forward(&x.to_dtype(compute_dtype)?)?;
+        let output = (ffn_output + attn_output)?;
 
-        anyhow::Ok(output)
+        Ok(output)
     }
 }
 
+/// The mixer (or "motor") of a transformer layer.
+///
+/// LFM2 uses a hybrid architecture where some layers use standard attention
+/// and others use a short convolution. This enum allows each layer to
+/// select its mixer type.
 pub enum Lfm2Mixer {
+    /// Multi-head attention with RoPE and QK-normalization
     Attention(AttentionMixer),
+    /// Short convolution with gating mechanism
     ShortConv(ShortConvMixer),
 }
 
+/// Multi-head attention mixer with RoPE and QK-normalization.
+///
+/// This implements grouped-query attention (GQA) where the number of KV heads
+/// may be less than the number of query heads. It also applies QK-normalization
+/// which is specific to LFM2.
 pub struct AttentionMixer {
+    /// Query projection (blk.N.attn_q.weight)
     q_proj: Linear,
+    /// Key projection (blk.N.attn_k.weight)
     k_proj: Linear,
+    /// Value projection (blk.N.attn_v.weight)
     v_proj: Linear,
+    /// Output projection (blk.N.attn_output.weight)
     o_proj: Linear,
-    q_norm: RmsNorm, // blk.N.attn_q_norm
-    k_norm: RmsNorm, // blk.N.attn_k_norm
+    /// Query normalization (blk.N.attn_q_norm) - LFM2 specific
+    q_norm: RmsNorm,
+    /// Key normalization (blk.N.attn_k_norm) - LFM2 specific
+    k_norm: RmsNorm,
+    /// Cached attention mask indices (lazily initialized)
     mask_indices: OnceCell<Tensor>,
+    /// Rotary position embeddings
     rope: Arc<RotaryEmbedding>,
+    /// Dimension of each attention head
     head_dim: usize,
+    /// Number of query heads
     n_heads: usize,
+    /// Number of key/value heads (for grouped-query attention)
     n_kv_heads: usize,
+    /// Maximum sequence length for attention mask
     max_seq_len: usize,
 }
 
 impl AttentionMixer {
+    /// Forward pass through the attention mixer.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor of shape [batch, seq_len, hidden_size]
+    /// * `cache` - KV cache for incremental decoding
+    /// * `pos` - Current position in the sequence (for RoPE)
+    /// * `compute_dtype` - Data type for computations
+    /// * `use_flash` - Whether to use flash attention (if available on CUDA)
+    ///
+    /// # Returns
+    /// Output tensor of shape [batch, seq_len, hidden_size]
     pub fn forward(
         &self,
         x: &Tensor,
@@ -99,154 +161,212 @@ impl AttentionMixer {
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         let x = x.to_dtype(compute_dtype)?;
-        // Proj forward pass
-        let q = self.q_proj.forward(&x)?;
-        let k = self.k_proj.forward(&x)?;
-        let v = self.v_proj.forward(&x)?;
 
-        // Adding attention head dim
-        let (b, s, _) = q.dims3()?;
-
-        let q = q
-            .reshape((b, s, self.n_heads, self.head_dim))?
-            .permute((0, 2, 1, 3))?;
-        let k = k
-            .reshape((b, s, self.n_kv_heads, self.head_dim))?
-            .permute((0, 2, 1, 3))?;
-        let v = v
-            .reshape((b, s, self.n_kv_heads, self.head_dim))?
-            .permute((0, 2, 1, 3))?;
-
-        // 1. Apply RoPE (Rotary Position Embeddings)
+        // 1. Project input to Q, K, V
+        let (batch_size, seq_len, _) = x.dims3()?;
+        let (q, k, v) = self.project_qkv(&x)?;
+        
+        // 2. Apply RoPE to Q and K
         let q = self.rope.forward(&q, pos)?;
         let k = self.rope.forward(&k, pos)?;
 
-        // 2. Apply QK-Norm (LFM2 specific)
+        // 3. Apply QK-normalization (LFM2 specific: Q uses q_norm, K uses k_norm)
         let q = self.q_norm.forward(&q.to_dtype(DType::F32)?)?;
         let k = self.k_norm.forward(&k.to_dtype(DType::F32)?)?;
 
-        // 3. Caching: Append current K,V to history in f16
+        // 4. Update KV cache and compute attention
         let k = k.to_dtype(DType::F16)?;
         let v = v.to_dtype(DType::F16)?;
-        let (k, v) = match cache {
-            Some(MixedCache::KvCache(kv_cache)) => {
-                kv_cache.append(&k, &v).map_err(anyhow::Error::msg)?
-            }
-            _ => (k, v),
-        };
+        let (k, v) = self.update_cache(k, v, cache)?;
+
         range_push!("Compute attn");
-        // 4. Attention Math
-        let y = self.compute_attention(
-            q,
-            k,
-            v,
-            compute_dtype,
-            use_flash,
-        )?;
+        let y = self.compute_attention(q, k, v, compute_dtype, use_flash)?;
         range_pop!();
 
-        // Flatten: [B, S, H, D] -> [B, S, H * D]
-        let y = y.reshape((b, s, self.head_dim * self.n_heads))?;
-        anyhow::Ok(self.o_proj.forward(&y)?)
+        // 5. Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
+        let y = y.reshape((batch_size, seq_len, self.head_dim * self.n_heads))?;
+        Ok(self.o_proj.forward(&y)?)
     }
 
+    /// Project input to query, key, and value tensors with head dimensions.
+    fn project_qkv(&self, x: &Tensor) -> anyhow::Result<(Tensor, Tensor, Tensor)> {
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        let (batch_size, seq_len, _) = q.dims3()?;
+
+        let q = q
+            .reshape((batch_size, seq_len, self.n_heads, self.head_dim))?
+            .permute((0, 2, 1, 3))?;
+        let k = k
+            .reshape((batch_size, seq_len, self.n_kv_heads, self.head_dim))?
+            .permute((0, 2, 1, 3))?;
+        let v = v
+            .reshape((batch_size, seq_len, self.n_kv_heads, self.head_dim))?
+            .permute((0, 2, 1, 3))?;
+
+        Ok((q, k, v))
+    }
+
+    /// Update KV cache with new keys and values.
+    fn update_cache(
+        &self,
+        k: Tensor,
+        v: Tensor,
+        cache: &mut Option<MixedCache>,
+    ) -> anyhow::Result<(Tensor, Tensor)> {
+        match cache {
+            Some(MixedCache::KvCache(kv_cache)) => {
+                kv_cache.append(&k, &v).map_err(anyhow::Error::msg)
+            }
+            _ => Ok((k, v)),
+        }
+    }
+
+    /// Compute attention scores and apply attention weights to values.
+    ///
+    /// Uses either flash attention (on CUDA) or standard grouped-query attention.
     fn compute_attention(
         &self,
         q: Tensor,
         k: Tensor,
         v: Tensor,
         compute_dtype: DType,
-        _use_flash: bool,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+        use_flash: bool,
     ) -> anyhow::Result<Tensor> {
-        // Scores Q @ K.T) / sqrt(head_dim)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
 
+        // Try flash attention on CUDA if available
         #[cfg(feature = "cuda")]
-        if _use_flash && q.device().is_cuda() {
-            // Flash attention expects [Batch, Seq, Heads, Head_Dim]
-            // Note: LFM2 usually needs a transpose to put heads in the 3rd slot
-
-            let q = q.transpose(1, 2)?.to_dtype(DType::BF16)?.contiguous()?;
-            let k = k.transpose(1, 2)?.to_dtype(DType::BF16)?.contiguous()?;
-            let v = v.transpose(1, 2)?.to_dtype(DType::BF16)?.contiguous()?;
-
-            // causal: true handles the masking
-            let attn = flash_attn(&q, &k, &v, scale as f32, true)?.to_dtype(compute_dtype)?;
-            return anyhow::Ok(attn);
+        {
+            if use_flash && q.device().is_cuda() {
+                return self.compute_flash_attention(q, k, v, scale, compute_dtype);
+            }
         }
 
-        // Grouped-Query Attention in F32
-        let (_b, _h, q_s, _d) = q.dims4()?;
+        // Fall back to standard grouped-query attention
+        self.compute_gqa(q, k, v, scale, compute_dtype)
+    }
 
-        let k = crate::model::utility::repeat_kv(k, self.n_heads / self.n_kv_heads)?.to_dtype(DType::F32)?;
-        let v = crate::model::utility::repeat_kv(v, self.n_heads / self.n_kv_heads)?.to_dtype(DType::F32)?;
+    /// Compute attention using flash attention (CUDA only).
+    #[cfg(feature = "cuda")]
+    fn compute_flash_attention(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        scale: f64,
+        compute_dtype: DType,
+    ) -> anyhow::Result<Tensor> {
+        // Flash attention expects [Batch, Seq, Heads, Head_Dim]
+        let q = q.transpose(1, 2)?.to_dtype(DType::BF16)?.contiguous()?;
+        let k = k.transpose(1, 2)?.to_dtype(DType::BF16)?.contiguous()?;
+        let v = v.transpose(1, 2)?.to_dtype(DType::BF16)?.contiguous()?;
 
+        // causal: true handles the masking
+        let attn = flash_attn(&q, &k, &v, scale as f32, true)?;
+        Ok(attn.to_dtype(compute_dtype)?)
+    }
+
+    /// Compute grouped-query attention (GQA) with causal masking.
+    fn compute_gqa(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        scale: f64,
+        compute_dtype: DType,
+    ) -> anyhow::Result<Tensor> {
+        let (_batch, _heads, seq_len, _dim) = q.dims4()?;
+
+        // Repeat KV heads for grouped-query attention
+        let n_repeat = self.n_heads / self.n_kv_heads;
+        let k = crate::model::utility::repeat_kv(k, n_repeat)?.to_dtype(DType::F32)?;
+        let v = crate::model::utility::repeat_kv(v, n_repeat)?.to_dtype(DType::F32)?;
+
+        // Compute attention scores: Q @ K.T / sqrt(head_dim)
         let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
-        let attn = if q_s > 1 {
-            let mask = self.get_mask(q_s, self.max_seq_len, compute_dtype, q.device())?;
+        // Apply causal mask for sequences longer than 1 token
+        let attn = if seq_len > 1 {
+            let mask = self.get_mask(seq_len, compute_dtype, q.device())?;
             let attn = attn.to_dtype(compute_dtype)?;
             attn.broadcast_add(&mask)?.to_dtype(DType::F32)?
         } else {
             attn
         };
 
+        // Softmax and apply to values
         let attn_weights = softmax(&attn, candle_core::D::Minus1)?;
-
         let y_t = attn_weights.matmul(&v)?;
 
-        // Cast back to compute dtype
-        let y_t = y_t.to_dtype(compute_dtype)?;
-
-        anyhow::Ok(y_t.transpose(1, 2)?)
+        // Cast back to compute dtype and transpose to [B, S, H, D]
+        Ok(y_t.to_dtype(compute_dtype)?.transpose(1, 2)?)
     }
 
+    /// Get or create the causal attention mask for the given sequence length.
     fn get_mask(
         &self,
         seq_len: usize,
-        max_seq_len: usize,
         dtype: DType,
         device: &Device,
     ) -> anyhow::Result<Tensor> {
-        // Slice the 1D indices to [S]
-        let indices = self
-            .mask_indices
-            .get_or_try_init(|| Tensor::arange(0u32, max_seq_len as u32, device))?;
+        // Lazily initialize the mask indices
+        let indices = self.mask_indices.get_or_try_init(|| {
+            Tensor::arange(0u32, self.max_seq_len as u32, device)
+        })?;
         let idx = indices.narrow(0, 0, seq_len)?;
 
-        // Broadcast into [S, 1] and [1, S]
-        let i = idx.reshape((seq_len, 1))?;
-        let j = idx.reshape((1, seq_len))?;
+        // Create causal mask: positions i < j should be masked
+        let i = idx.reshape((seq_len, 1))?.broadcast_as((seq_len, seq_len))?;
+        let j = idx.reshape((1, seq_len))?.broadcast_as((seq_len, seq_len))?;
+        let mask = i.lt(&j)?;
 
-        // Broadcast [S, 1] to [S, S] and [1, S] to [S, S]
-        let i = i.broadcast_as((seq_len, seq_len))?;
-        let j = j.broadcast_as((seq_len, seq_len))?;
-
-        let cond = i.lt(&j)?; // This is [S, S]
-
-        let on_true = Tensor::new(f32::NEG_INFINITY, device)?
+        // Apply mask: masked positions get -inf, others get 0
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?
             .to_dtype(dtype)?
-            .broadcast_as((seq_len, seq_len))?; // Match the shape!
-
-        let on_false = Tensor::new(0f32, device)?
+            .broadcast_as((seq_len, seq_len))?;
+        let zeros = Tensor::new(0f32, device)?
             .to_dtype(dtype)?
-            .broadcast_as((seq_len, seq_len))?; // Match the shape!
+            .broadcast_as((seq_len, seq_len))?;
 
-        anyhow::Ok(cond.where_cond(&on_true, &on_false)?)
-
+        Ok(mask.where_cond(&neg_inf, &zeros)?)
     }
 }
 
+/// Short convolution mixer with gating mechanism.
+///
+/// This mixer uses a depth-wise 1D convolution instead of attention.
+/// It projects the input into three parts (B, C, H), applies gating
+/// before and after the convolution, and uses a cache for efficient
+/// incremental decoding.
 pub struct ShortConvMixer {
-    in_proj: Linear,  // Input, Gate, and Condition projections
-    conv: Conv1d,     // The depth-wise 1D convolution
-    out_proj: Linear, // Output projection
+    /// Input projection that splits into B, C, H (gate, gate, signal)
+    in_proj: Linear,
+    /// Depth-wise 1D convolution (groups = channels)
+    conv: Conv1d,
+    /// Output projection
+    out_proj: Linear,
+    /// Cache length for convolution state
     conv_l_cache: usize,
+    /// Convolution kernel size
     kernel_size: usize,
+    /// Whether to run convolution on CPU (useful for CUDA performance)
     conv_on_cpu: bool,
 }
 
 impl ShortConvMixer {
+    /// Forward pass through the short convolution mixer.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor of shape [batch, seq_len, hidden_size]
+    /// * `cache` - Convolution cache for incremental decoding
+    /// * `compute_dtype` - Data type for computations
+    ///
+    /// # Returns
+    /// Output tensor of shape [batch, seq_len, hidden_size]
     pub fn forward(
         &self,
         input: &Tensor,
@@ -255,121 +375,204 @@ impl ShortConvMixer {
     ) -> anyhow::Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = input.dims3()?;
 
-        // 1. Project: [B, S, 1024] -> [B, S, 3072]
-        let in_proj = self.in_proj.forward(&input.to_dtype(compute_dtype)?)?;
+        // 1. Project input to [B, S, 3 * hidden_size] and split into gates and signal
+        let projected = self.in_proj.forward(&input.to_dtype(compute_dtype)?)?;
+        let chunks = projected.chunk(3, 2)?;
+        let (b_gate, c_gate, h_signal) = match &chunks[..] {
+            [b, c, h] => (b, c, h),
+            _ => unreachable!("chunk(3, 2) always returns 3 tensors"),
+        };
 
-        // 2. Split into 3 chunks of 1024
-        let [b_gate, c_gate, h_signal] = in_proj.chunk(3, 2)?.try_into().unwrap();
+        // 2. First gating: y = B ⊙ h
+        let gated = (b_gate * h_signal)?;
 
-        // 3. First Gating: y = B ⊙ h˜
-        let y = (b_gate * h_signal)?;    
+        // 3. Convolution with caching
+        let conv_input = gated.transpose(1, 2)?;
+        let conv_out = self.conv_forward(conv_input, cache, batch_size, seq_len, hidden_size)?;
+        let conv_out = conv_out.to_dtype(compute_dtype)?.transpose(1, 2)?;
 
-        // 3. Convolution: z = Convk(y)
-        let y_t = y.transpose(1, 2)?;
+        // 4. Second gating: C ⊙ conv(z)
+        let gated_output = (c_gate * conv_out)?;
 
-        // 4. Add cache or padding if needed and perform conv forward
-        let conv_out = self.conv_on_cpu(y_t, cache, batch_size, seq_len, hidden_size)?;
-
-        let conv_out = conv_out.to_dtype(compute_dtype)?;
-        // Move back to [B, S, 1024]
-        let conv_out = conv_out.transpose(1, 2)?;
-
-        // 5. Second Gating: C ⊙ z
-        let gated_z = (c_gate * conv_out)?;
-
-        // 6. Output Projection: o = Linearout(...)
-        anyhow::Ok(self.out_proj.forward(&gated_z)?)
+        // 5. Output projection
+        Ok(self.out_proj.forward(&gated_output)?)
     }
 
-    fn conv_on_cpu(
-        &self, 
-        input: Tensor, 
+    /// Perform convolution with caching support.
+    ///
+    /// Handles both prefill (seq_len > 1) and decode (seq_len == 1) modes.
+    fn conv_forward(
+        &self,
+        input: Tensor,
         cache: &mut Option<MixedCache>,
-        batch_size: usize, 
-        seq_len: usize, 
-        hidden_size: usize
+        batch_size: usize,
+        seq_len: usize,
+        hidden_size: usize,
     ) -> anyhow::Result<Tensor> {
-        let _conv = range!("Conv forward (cache and forward)");
+        let _range = range!("Conv forward (cache and forward)");
+
+        // Optionally move to CPU for convolution
         let original_device = input.device().clone();
-        let input = if original_device.is_cuda() {
+        let input = if self.conv_on_cpu && original_device.is_cuda() {
             input.to_device(&Device::Cpu)?
         } else {
             input
         };
 
-        let conv_in_cached = if seq_len == 1 {
-            if let Some(MixedCache::ConvCache(state)) = cache {
-                let input_cached = Tensor::cat(&[&*state, &input], 2)?;
-                let s_current = input_cached.dims()[2];
-                    
-                *cache = Some(MixedCache::ConvCache(input_cached.narrow(
-                    2,
-                    s_current - (self.conv_l_cache - 1),
-                    self.conv_l_cache - 1,
-                )?));
-                input_cached.narrow(2, s_current - self.conv_l_cache, self.conv_l_cache)?
-            } else {
-                // Single token without cache: pad left to match kernel size
-                let pad_len = self.kernel_size - 1;
-                let pad = Tensor::zeros((batch_size, hidden_size, pad_len), input.dtype(), &Device::Cpu)?;
-                Tensor::cat(&[pad, input.clone()], 2)?
-            }
-        } else {
-            // PRE-FILL
-            // 1. Manually pad left: [B, 1024, 2]
-            let pad_len = self.kernel_size - 1;
-            let pad = Tensor::zeros((batch_size, hidden_size, pad_len), input.dtype(), &Device::Cpu)?;
+        // Prepare input with cache/padding
+        let conv_input = self.prepare_conv_input(&input, cache, batch_size, seq_len, hidden_size)?;
 
-            // 2. Update cache with the last 2 tokens of the REAL signal
-            if seq_len >= pad_len {
-                *cache = Some(MixedCache::ConvCache(input.narrow(2, seq_len - pad_len, pad_len)?));
-            }
+        // Perform convolution in F32
+        let conv_input = conv_input.to_dtype(DType::F32)?;
+        let conv_out = self.conv.forward(&conv_input)?;
 
-            Tensor::cat(&[pad, input.clone()], 2)?
-        };
-
-        // 3. Forward: Result length is (S + 2) - 3 + 1 = S.
-        let conv_in_cached = conv_in_cached.to_dtype(DType::F32)?;
-        let conv_out = self.conv.forward(&conv_in_cached)?;
-
-        let output = if original_device.is_cuda() {
+        // Move back to original device if needed
+        let output = if self.conv_on_cpu && original_device.is_cuda() {
             conv_out.to_device(&original_device)?
         } else {
             conv_out
         };
+        Ok(output)
+    }
 
-        anyhow::Ok(output)    
+    /// Prepare convolution input with caching or padding.
+    fn prepare_conv_input(
+        &self,
+        input: &Tensor,
+        cache: &mut Option<MixedCache>,
+        batch_size: usize,
+        seq_len: usize,
+        hidden_size: usize,
+    ) -> anyhow::Result<Tensor> {
+        let pad_len = self.kernel_size - 1;
+
+        if seq_len == 1 {
+            // Decode mode: use cache or pad
+            self.prepare_decode_input(input, cache, batch_size, hidden_size, pad_len)
+        } else {
+            // Prefill mode: pad left and update cache
+            self.prepare_prefill_input(input, cache, batch_size, seq_len, hidden_size, pad_len)
+        }
+    }
+
+    /// Prepare input for decode mode (single token).
+    fn prepare_decode_input(
+        &self,
+        input: &Tensor,
+        cache: &mut Option<MixedCache>,
+        batch_size: usize,
+        hidden_size: usize,
+        pad_len: usize,
+    ) -> anyhow::Result<Tensor> {
+        if let Some(MixedCache::ConvCache(state)) = cache {
+            // Clone the state tensor to use it
+            let state_tensor = state.clone();
+            // Concatenate cached state with new input
+            let input_cached = Tensor::cat(&[&state_tensor, input], 2)?;
+            let current_len = input_cached.dims()[2];
+
+            // Update cache with the last (kernel_size - 1) tokens
+            let new_cache = input_cached.narrow(
+                2,
+                current_len - (self.conv_l_cache - 1),
+                (self.conv_l_cache - 1),
+            )?;
+            *cache = Some(MixedCache::ConvCache(new_cache));
+
+            // Use the last kernel_size tokens for convolution
+            Ok(input_cached.narrow(2, current_len - self.kernel_size, self.kernel_size)?)
+        } else {
+            // No cache: pad left to match kernel size
+            let pad = Tensor::zeros(
+                (batch_size, hidden_size, pad_len),
+                input.dtype(),
+                input.device(),
+            )?;
+            Ok(Tensor::cat(&[pad, input.clone()], 2)?)
+        }
+    }
+
+    /// Prepare input for prefill mode (multiple tokens).
+    fn prepare_prefill_input(
+        &self,
+        input: &Tensor,
+        cache: &mut Option<MixedCache>,
+        batch_size: usize,
+        seq_len: usize,
+        hidden_size: usize,
+        pad_len: usize,
+    ) -> anyhow::Result<Tensor> {
+        // Pad left to maintain causal convolution
+        let pad = Tensor::zeros(
+            (batch_size, hidden_size, pad_len),
+            input.dtype(),
+            input.device(),
+        )?;
+
+        // Update cache with the last pad_len tokens for future decode steps
+        if seq_len >= pad_len {
+            let new_cache = input.narrow(2, seq_len - (self.conv_l_cache - 1), (self.conv_l_cache - 1))?;
+            *cache = Some(MixedCache::ConvCache(new_cache));
+        }
+
+        Ok(Tensor::cat(&[pad, input.clone()], 2)?)
     }
 }
 
 
+/// Feed-forward network with SwiGLU activation.
+///
+/// This implements the standard FFN used in LFM2:
+/// FFN(x) = down_proj(silu(gate_proj(x)) * up_proj(x))
+///
+/// The activation is computed in F32 for numerical stability,
+/// then cast back to the compute dtype.
 pub struct Lfm2Ffn {
-    pub up_proj: Linear,   // blk.N.ffn_up
-    pub gate_proj: Linear, // blk.N.ffn_gate
-    pub down_proj: Linear, // blk.N.ffn_down
+    /// Up projection (blk.N.ffn_up)
+    pub up_proj: Linear,
+    /// Gate projection with SwiGLU activation (blk.N.ffn_gate)
+    pub gate_proj: Linear,
+    /// Down projection (blk.N.ffn_down)
+    pub down_proj: Linear,
+    /// Data type used for computations
     pub compute_dtype: DType,
 }
 
 impl Lfm2Ffn {
+    /// Forward pass through the FFN with SwiGLU activation.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor of shape [batch, seq_len, hidden_size]
+    ///
+    /// # Returns
+    /// Output tensor of shape [batch, seq_len, hidden_size]
     pub fn forward(&self, input: &Tensor) -> anyhow::Result<Tensor> {
-        // 1. Projections in compute_dtype (F16/BF16)
-        let input = &input.to_dtype(self.compute_dtype)?;
-        let up_proj = self.up_proj.forward(input)?;
-        let gate_proj = self.gate_proj.forward(input)?;
+        let input = input.to_dtype(self.compute_dtype)?;
 
-        // 2. Activation in F32 for stability
-        let gate_f32 = gate_proj.to_dtype(DType::F32)?;
-        let activated = silu(&gate_f32)?;
-        
-        // 3. Multiply and cast back to compute_dtype
-        let x = (activated.to_dtype(self.compute_dtype)? * up_proj)?;
+        // 1. Up and gate projections
+        let up = self.up_proj.forward(&input)?;
+        let gate = self.gate_proj.forward(&input)?;
 
-        // 4. Final projection in compute_dtype
-        anyhow::Ok(self.down_proj.forward(&x)?)
+        // 2. SwiGLU activation: silu(gate) * up (computed in F32 for stability)
+        let gate_activated = silu(&gate.to_dtype(DType::F32)?)?;
+        let gated = (gate_activated.to_dtype(self.compute_dtype)? * up)?;
+
+        // 3. Down projection
+        Ok(self.down_proj.forward(&gated)?)
     }
 }
 
 impl Model for Lfm2Model {
+    /// Forward pass through the entire LFM2 model.
+    ///
+    /// # Arguments
+    /// * `input` - Token IDs of shape [batch, seq_len]
+    /// * `cache` - Vector of caches (one per layer) for incremental decoding
+    /// * `pos` - Current position in the sequence (for RoPE)
+    /// * `use_flash` - Whether to use flash attention (if available)
+    ///
+    /// # Returns
+    /// Logits of shape [batch, seq_len, vocab_size]
     fn forward(
         &self,
         input: &Tensor,
@@ -377,58 +580,85 @@ impl Model for Lfm2Model {
         pos: usize,
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
-        // 1. Embeddings
+        // 1. Token embeddings
         range_push!("Embed step");
-        let mut x = self.embed_layer.forward(&input)?;
+        let mut x = self.embed_layer.forward(input)?;
         range_pop!();
-        // 2. Attention and conv layers
+
+        // 2. Transformer layers
         range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, cache.get_mut(i).unwrap(), pos, self.compute_dtype, use_flash)?;
+            x = layer.forward(
+                &x,
+                cache.get_mut(i).unwrap(),
+                pos,
+                self.compute_dtype,
+                use_flash,
+            )?;
         }
         range_pop!();
-        // 3. Embed norm
-        let output = self.embed_norm.forward(&x.to_dtype(DType::F32)?)?;
 
-        // 4. Output projection
-        let logits = self.lm_head.forward(&output.to_dtype(self.compute_dtype)?)?;
+        // 3. Final normalization and output projection
+        let x = self.embed_norm.forward(&x.to_dtype(DType::F32)?)?;
+        let logits = self.lm_head.forward(&x.to_dtype(self.compute_dtype)?)?;
 
-        anyhow::Ok(logits)
+        Ok(logits)
     }
 
+    /// Initialize caches for all layers.
+    ///
+    /// Attention layers get a KV cache, while convolution layers start with None
+    /// (cache is created on the first forward pass).
     fn init_cache(&self) -> anyhow::Result<Vec<Option<MixedCache>>> {
-        let mut caches = Vec::new();
-        for layer in &self.layers {
-            match &layer.mixer {
+        let caches = self
+            .layers
+            .iter()
+            .map(|layer| match &layer.mixer {
                 Lfm2Mixer::Attention(_) => {
-                    caches.push(Some(MixedCache::KvCache(ConcatKvCache::new(2))))
+                    Some(MixedCache::KvCache(ConcatKvCache::new(2)))
                 }
-                Lfm2Mixer::ShortConv(_) => caches.push(None),
-            }
-        }
+                Lfm2Mixer::ShortConv(_) => None,
+            })
+            .collect();
         Ok(caches)
     }
 }
 
 impl Lfm2Model {
-    pub fn load(config: ModelConfig, var_builder: VarBuilder, compute_dtype: DType, max_seq_len: usize, conv_on_cpu: bool) -> anyhow::Result<Self> {
+    /// Load and initialize the LFM2 model from GGUF weights.
+    ///
+    /// # Arguments
+    /// * `config` - Model configuration
+    /// * `var_builder` - Variable builder for loading GGUF tensors
+    /// * `compute_dtype` - Data type for computations (F16, BF16, or F32)
+    /// * `requested_max_seq_len` - Requested maximum sequence length (will be capped by config)
+    /// * `conv_on_cpu` - Whether to run convolutions on CPU
+    ///
+    /// # Returns
+    /// Initialized LFM2 model
+    pub fn load(
+        config: ModelConfig,
+        var_builder: VarBuilder,
+        compute_dtype: DType,
+        requested_max_seq_len: usize,
+        conv_on_cpu: bool,
+    ) -> anyhow::Result<Self> {
         let _range = range!("Lfm2Model loading");
+
         let rms_epsilon = config.rms_epsilon as f64;
         let hidden_size = config.hidden_size;
         let n_layers = config.n_layers;
         let n_heads = config.n_heads;
-        let max_seq_len = config.max_seq_len.min(max_seq_len);
         let head_dim = hidden_size / n_heads;
         let device = var_builder.device();
 
-        // Retrieve embd weights
-        let embed_tensor = Self::get_tensor(
-            "token_embd.weight", 
-            var_builder.clone(), 
-            compute_dtype
-        )?;
+        // Use the smaller of requested and configured max sequence length
+        let effective_max_seq_len = config.max_seq_len.min(requested_max_seq_len);
 
-        // Final output head
+        // Load embeddings (shared between input and output if no separate output.weight)
+        let embed_tensor =
+            Self::get_tensor("token_embd.weight", var_builder.clone(), compute_dtype)?;
+
         let lm_head_tensor = if var_builder.contains_key("output.weight") {
             Self::get_tensor("output.weight", var_builder.clone(), compute_dtype)?
         } else {
@@ -438,28 +668,35 @@ impl Lfm2Model {
         let embed_layer = Embedding::new(embed_tensor, hidden_size);
         let lm_head = Linear::new(lm_head_tensor, None);
 
-        // Retrieve embd norm weights
-        let embed_norm = RmsNorm::new(hidden_size, rms_epsilon, var_builder.pp("token_embd_norm"))?;
+        // Load embedding normalization
+        let embed_norm =
+            RmsNorm::new(hidden_size, rms_epsilon, var_builder.pp("token_embd_norm"))?;
 
-        // Init Rope
+        // Initialize rotary position embeddings
         let rope = Arc::new(RotaryEmbedding::new(
             config.rope_theta,
             head_dim,
-            max_seq_len,
+            effective_max_seq_len,
             device,
         )?);
 
-        //Build layers
-        let rope = Arc::clone(&rope);
-
+        // Load all transformer layers in parallel
+        let rope_clone = Arc::clone(&rope);
         let layers = (0..n_layers)
             .into_par_iter()
             .map(|i| {
-                Self::load_layer(var_builder.clone(), i, rope.clone(), &config, compute_dtype.clone(), conv_on_cpu)
+                Self::load_layer(
+                    var_builder.clone(),
+                    i,
+                    rope_clone.clone(),
+                    &config,
+                    compute_dtype,
+                    conv_on_cpu,
+                )
             })
             .collect::<anyhow::Result<Vec<Lfm2Layer>>>()?;
 
-        anyhow::Ok(Self {
+        Ok(Self {
             embed_layer,
             embed_norm,
             layers,
@@ -468,173 +705,241 @@ impl Lfm2Model {
         })
     }
 
-    fn load_layer(var_builder: VarBuilder, block_index: usize, rope: Arc<RotaryEmbedding>, config: &ModelConfig, compute_dtype: DType, conv_on_cpu: bool) -> anyhow::Result<Lfm2Layer> {
-        let var_builder = var_builder.pp(format!("blk.{}", block_index));
-        let conv_device = if conv_on_cpu { Device::Cpu } else { var_builder.device().clone() };
-        
+    /// Load a single transformer layer.
+    ///
+    /// Determines whether the layer uses attention or convolution based on n_kv_heads.
+    fn load_layer(
+        var_builder: VarBuilder,
+        block_index: usize,
+        rope: Arc<RotaryEmbedding>,
+        config: &ModelConfig,
+        compute_dtype: DType,
+        conv_on_cpu: bool,
+    ) -> anyhow::Result<Lfm2Layer> {
+        let layer_prefix = format!("blk.{}", block_index);
+        let var_builder = var_builder.pp(layer_prefix);
+        let conv_device = if conv_on_cpu {
+            Device::Cpu
+        } else {
+            var_builder.device().clone()
+        };
+
         let rms_epsilon = config.rms_epsilon as f64;
         let n_kv_heads = config.n_kv_heads[block_index];
         let head_dim = config.hidden_size / config.n_heads;
 
-        // 1. Attention norm
-        let attn_norm = RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("attn_norm"))?;
+        // 1. Attention normalization
+        let attn_norm =
+            RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("attn_norm"))?;
 
-        // 2. Mixer of attention or shortconv
+        // 2. Load mixer (attention or convolution)
         let mixer = if n_kv_heads > 0 {
-            let attn_mixer = AttentionMixer {
-                q_proj: Linear::new(
-                    Self::get_tensor(
-                        "attn_q.weight",
-                        var_builder.clone(),
-                        compute_dtype
-                    )?,
-                    None),
-                k_proj: Linear::new(
-                    Self::get_tensor(
-                        "attn_k.weight",
-                        var_builder.clone(),
-                        compute_dtype
-                    )?,
-                    None),
-                v_proj: Linear::new(
-                    Self::get_tensor(
-                        "attn_v.weight",
-                        var_builder.clone(),
-                        compute_dtype
-                    )?,
-                    None),
-                o_proj: Linear::new(
-                    Self::get_tensor(
-                        "attn_output.weight",
-                        var_builder.clone(),
-                        compute_dtype
-                    )?,
-                    None),
-                q_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_q_norm"))?,
-                k_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_k_norm"))?,
+            Lfm2Mixer::Attention(Self::load_attention_mixer(
+                &var_builder,
                 rope,
-                mask_indices: OnceCell::new(),
                 head_dim,
-                n_heads: config.n_heads,
+                config.n_heads,
                 n_kv_heads,
-                max_seq_len: config.max_seq_len,
-            };
-            Lfm2Mixer::Attention(attn_mixer)
+                config.max_seq_len,
+                rms_epsilon,
+                compute_dtype,
+            )?)
         } else {
-            let raw_conv_weights = var_builder.get_no_shape("shortconv.conv.weight")?;
-            let (channels, kernel_size) = raw_conv_weights.shape().dims2()?;
-            let conv_cfg = Conv1dConfig {
-                groups: channels,
-                padding: 0,
-                ..Default::default()
-            };
-            let conv_weights = raw_conv_weights
-                .dequantize(&conv_device)?
-                .unsqueeze(1)?;
-            let conv_mixer = ShortConvMixer {
-                in_proj: Linear::new(
-                    Self::get_tensor(
-                        "shortconv.in_proj.weight", 
-                        var_builder.clone(), 
-                        compute_dtype)?, 
-                    None),
-                conv: Conv1d::new(conv_weights, None, conv_cfg),
-                out_proj: Linear::new(
-                    Self::get_tensor(
-                        "shortconv.out_proj.weight", 
-                        var_builder.clone(), 
-                        compute_dtype)?, 
-                    None),
-                conv_l_cache: config.conv_l_cache,
-                kernel_size,
+            Lfm2Mixer::ShortConv(Self::load_conv_mixer(
+                &var_builder,
+                conv_device,
+                config.conv_l_cache,
                 conv_on_cpu,
-            };
-            Lfm2Mixer::ShortConv(conv_mixer)
+                compute_dtype,
+            )?)
         };
 
-        // 3. ffn norm
-        let ffn_norm = RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("ffn_norm"))?;
+        // 3. FFN normalization
+        let ffn_norm =
+            RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("ffn_norm"))?;
 
-        // 4. Common ffn block
-        let ffn = Lfm2Ffn {
-            up_proj: Linear::new(
-                    Self::get_tensor(
-                        "ffn_up.weight", 
-                        var_builder.clone(), 
-                        compute_dtype)?, 
-                    None),
-            gate_proj: Linear::new(
-                    Self::get_tensor(
-                        "ffn_gate.weight", 
-                        var_builder.clone(), 
-                        compute_dtype)?, 
-                    None),
-            down_proj: Linear::new(
-                    Self::get_tensor(
-                        "ffn_down.weight", 
-                        var_builder.clone(), 
-                        compute_dtype)?, 
-                    None),
-            compute_dtype,
-        };
+        // 4. Load FFN
+        let ffn = Self::load_ffn(&var_builder, compute_dtype)?;
 
-        anyhow::Ok(Lfm2Layer { attn_norm, mixer, ffn_norm, ffn })
+        Ok(Lfm2Layer {
+            attn_norm,
+            mixer,
+            ffn_norm,
+            ffn,
+        })
     }
 
-    fn get_tensor(tensor_name: &str, var_builder: VarBuilder, compute_dtype: DType) -> anyhow::Result<Tensor> {
+    /// Load an attention mixer for a layer.
+    fn load_attention_mixer(
+        var_builder: &VarBuilder,
+        rope: Arc<RotaryEmbedding>,
+        head_dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        max_seq_len: usize,
+        rms_epsilon: f64,
+        compute_dtype: DType,
+    ) -> anyhow::Result<AttentionMixer> {
+        Ok(AttentionMixer {
+            q_proj: Linear::new(
+                Self::get_tensor("attn_q.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            k_proj: Linear::new(
+                Self::get_tensor("attn_k.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            v_proj: Linear::new(
+                Self::get_tensor("attn_v.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            o_proj: Linear::new(
+                Self::get_tensor("attn_output.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            q_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_q_norm"))?,
+            k_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_k_norm"))?,
+            rope,
+            mask_indices: OnceCell::new(),
+            head_dim,
+            n_heads,
+            n_kv_heads,
+            max_seq_len,
+        })
+    }
+
+    /// Load a convolution mixer for a layer.
+    fn load_conv_mixer(
+        var_builder: &VarBuilder,
+        conv_device: Device,
+        conv_l_cache: usize,
+        conv_on_cpu: bool,
+        compute_dtype: DType,
+    ) -> anyhow::Result<ShortConvMixer> {
+        // Load and prepare convolution weights (depth-wise, so groups = channels)
+        let raw_conv_weights = var_builder.get_no_shape("shortconv.conv.weight")?;
+        let (channels, kernel_size) = raw_conv_weights.shape().dims2()?;
+
+        let conv_cfg = Conv1dConfig {
+            groups: channels,
+            padding: 0,
+            ..Default::default()
+        };
+
+        let conv_weights = raw_conv_weights
+            .dequantize(&conv_device)?
+            .unsqueeze(1)?;
+
+        Ok(ShortConvMixer {
+            in_proj: Linear::new(
+                Self::get_tensor("shortconv.in_proj.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            conv: Conv1d::new(conv_weights, None, conv_cfg),
+            out_proj: Linear::new(
+                Self::get_tensor("shortconv.out_proj.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            conv_l_cache,
+            kernel_size,
+            conv_on_cpu,
+        })
+    }
+
+    /// Load FFN (feed-forward network) for a layer.
+    fn load_ffn(var_builder: &VarBuilder, compute_dtype: DType) -> anyhow::Result<Lfm2Ffn> {
+        Ok(Lfm2Ffn {
+            up_proj: Linear::new(
+                Self::get_tensor("ffn_up.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            gate_proj: Linear::new(
+                Self::get_tensor("ffn_gate.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            down_proj: Linear::new(
+                Self::get_tensor("ffn_down.weight", var_builder.clone(), compute_dtype)?,
+                None,
+            ),
+            compute_dtype,
+        })
+    }
+
+    /// Load a tensor from the GGUF model and convert to the target compute dtype.
+    ///
+    /// Handles quantized tensors (Q4, Q8, etc.) and converts them to the
+    /// appropriate compute dtype (F16, BF16, or F32) with optimized paths.
+    fn get_tensor(
+        tensor_name: &str,
+        var_builder: VarBuilder,
+        compute_dtype: DType,
+    ) -> anyhow::Result<Tensor> {
         let q_tensor = var_builder.get_no_shape(tensor_name)?;
         let device = var_builder.device();
-        
+
         let weight = match (q_tensor.dtype(), compute_dtype) {
-            // If the target is F32, always use the standard dequantize
+            // Target is F32: always dequantize to F32
             (_, DType::F32) => q_tensor.dequantize(device)?,
 
-            // If the source is already a float (F16/BF16), just dequantize + cast
+            // Source is already float: dequantize and cast
             (GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32, _) => {
                 q_tensor.dequantize(device)?.to_dtype(compute_dtype)?
             }
 
-            // If source is quantized and target is F16, use the fast path
+            // Quantized source to F16: use fast dequantize path
             (_, DType::F16) => q_tensor.dequantize_f16(device)?,
 
-            // For any other target (like BF16), dequantize to F32 then cast
+            // All other cases: dequantize to F32 then cast
             _ => q_tensor.dequantize(device)?.to_dtype(compute_dtype)?,
         };
-        
-        anyhow::Ok(weight)
+
+        Ok(weight)
     }
 }
 
+/// Rotary Position Embeddings (RoPE) for LFM2.
+///
+/// RoPE encodes position information by rotating query and key vectors
+/// in the complex plane. This implementation precomputes sine and cosine
+/// tables for all positions up to `max_seq_len`.
 pub struct RotaryEmbedding {
+    /// Precomputed cosine values for all positions
     cos: Tensor,
+    /// Precomputed sine values for all positions
     sin: Tensor,
 }
 
 impl RotaryEmbedding {
+    /// Create a new RotaryEmbedding instance.
+    ///
+    /// # Arguments
+    /// * `rope_theta` - Base frequency for RoPE (typically 10000.0)
+    /// * `head_dim` - Dimension of each attention head
+    /// * `max_seq_len` - Maximum sequence length to precompute
+    /// * `device` - Device to store the precomputed tables
     pub fn new(
         rope_theta: f32,
         head_dim: usize,
         max_seq_len: usize,
         device: &Device,
     ) -> anyhow::Result<Self> {
-        // 1. Generate the inverse frequencies (theta)
-        // theta_i = 1.0 / (base ^ (2i / dim))
+        // 1. Generate inverse frequencies: theta_i = 1.0 / (base ^ (2i / dim))
         let freqs: Vec<_> = (0..head_dim)
             .step_by(2)
             .map(|i| 1.0 / (rope_theta as f64).powf(i as f64 / head_dim as f64))
             .collect();
         let freqs = Tensor::new(freqs, device)?.to_dtype(candle_core::DType::F32)?;
 
-        // 2. Create the position range [0, 1, 2, ..., max_seq_len]
-        let t =
+        // 2. Create position indices [0, 1, 2, ..., max_seq_len]
+        let positions =
             Tensor::arange(0u32, max_seq_len as u32, device)?.to_dtype(candle_core::DType::F32)?;
 
-        // 3. Compute outer product: [max_seq_len, 1] * [1, head_dim/2] -> [max_seq_len, head_dim/2]
-        let freqs = t
+        // 3. Compute outer product: [max_seq_len, 1] × [1, head_dim/2] -> [max_seq_len, head_dim/2]
+        let freqs = positions
             .reshape((max_seq_len, 1))?
             .matmul(&freqs.reshape((1, freqs.dims1()?))?)?;
 
-        // 4. Cat with itself to match head_dim
+        // 4. Duplicate to get [max_seq_len, head_dim] (since we computed for half)
         let freqs = Tensor::cat(&[&freqs, &freqs], 1)?;
 
         Ok(Self {
@@ -643,12 +948,19 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Apply rotary position embeddings to a tensor.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor of shape [batch, heads, seq_len, head_dim]
+    /// * `pos` - Starting position in the sequence
+    ///
+    /// # Returns
+    /// Tensor with RoPE applied, same shape as input
     pub fn forward(&self, x: &Tensor, pos: usize) -> anyhow::Result<Tensor> {
-        // 1. Store the original dtype to convert back later
         let original_dtype = x.dtype();
-        let (_b, _h, seq_len, head_dim) = x.dims4()?;
+        let (_batch, _heads, seq_len, head_dim) = x.dims4()?;
 
-        // 2. Slice and prepare sin/cos (already in f32)
+        // Slice sine and cosine for the current position range
         let cos = self
             .cos
             .narrow(0, pos, seq_len)?
@@ -658,24 +970,22 @@ impl RotaryEmbedding {
             .narrow(0, pos, seq_len)?
             .reshape((1, 1, seq_len, head_dim))?;
 
-        // 3. Cast x to f32 for the rotation math
+        // Convert to F32 for rotation math
         let x_f32 = x.to_dtype(candle_core::DType::F32)?;
 
-        // Standard RoPE rotation: x_rotated = x*cos + rotate_half(x)*sin
-        let last_dim = x_f32.dims().last().unwrap();
-        let x1 = x_f32.narrow(candle_core::D::Minus1, 0, last_dim / 2)?;
-        let x2 = x_f32.narrow(candle_core::D::Minus1, last_dim / 2, last_dim / 2)?;
+        // Standard RoPE: x_rotated = x*cos + rotate_half(x)*sin
         // rotate_half([x1, x2]) -> [-x2, x1]
-        let x2_f32 = Tensor::cat(&[&x2.neg()?, &x1], candle_core::D::Minus1)?;
+        let half_dim = head_dim / 2;
+        let x1 = x_f32.narrow(candle_core::D::Minus1, 0, half_dim)?;
+        let x2 = x_f32.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+        let x_rotated = Tensor::cat(&[&x2.neg()?, &x1], candle_core::D::Minus1)?;
 
-        // 4. Perform math in f32
-        let rotated_f32 = (x_f32.broadcast_mul(&cos)? + x2_f32.broadcast_mul(&sin)?)?;
+        // Apply rotation: x*cos + rotated_x*sin
+        let rotated = (x_f32.broadcast_mul(&cos)? + x_rotated.broadcast_mul(&sin)?)?;
 
-        // 5. Cast back to original dtype (e.g., f16, bf16, or f32)
-        anyhow::Ok(
-            rotated_f32
-                .to_dtype(original_dtype)
-                .map_err(anyhow::Error::msg)?,
-        )
+        // Cast back to original dtype
+        rotated
+            .to_dtype(original_dtype)
+            .map_err(anyhow::Error::msg)
     }
 }
