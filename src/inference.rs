@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::rc::Rc;
 
 use crate::error::LociError;
-use crate::gguf::Loader;
+use crate::gguf::{GgufInfo, Loader};
 use crate::model::{MixedCache, Model, ModelBuilder};
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, GenerationConfig};
 use crate::tokenizer::{StreamState, TokenizerService, TokenizerServiceBuilder};
 use crate::session::ChatMessage;
 use candle_core::{DType, Device, Tensor};
@@ -14,7 +15,7 @@ use tokenizers::tokenizer::Encoding;
 use memmap2::MmapOptions;
 use once_cell::sync::OnceCell;
 use tracing::{debug};
-use nvtx::{range, range_push, range_pop};
+use nvtx::{range_push, range_pop};
 
 pub struct GenerationReport {
     pub text: String,
@@ -56,7 +57,7 @@ impl DeviceManager {
 }
 
 pub struct InferenceEngineBuilder {
-    model_path: Option<PathBuf>,
+    gguf_info: Option<Rc<GgufInfo>>,
     dtype: DType,
     max_seq_len: usize,
     conv_on_cpu: bool,
@@ -65,15 +66,15 @@ pub struct InferenceEngineBuilder {
 impl InferenceEngineBuilder {
     pub fn new() -> Self {
         Self {
-            model_path: None,
+            gguf_info: None,
             dtype: DType::F16,
             max_seq_len: 32_000,
             conv_on_cpu: true,
         }
     }
 
-    pub fn model_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.model_path = Some(path.as_ref().to_path_buf());
+    pub fn with_gguf_metadata(mut self, info: Rc<GgufInfo>) -> Self {
+        self.gguf_info = Some(info);
         self
     }
 
@@ -93,14 +94,13 @@ impl InferenceEngineBuilder {
     }
 
     pub fn build(self) -> Result<InferenceEngine, LociError> {
-        let model_path = self.model_path.ok_or_else(|| {
-            LociError::ModelLoad("model_path is required but was not set".into())
+        let gguf_info = self.gguf_info.ok_or_else(|| {
+            LociError::ModelLoad("gguf_info is required but was not set".into())
         })?;
-        range_push!("Gguf info load");
-        let gguf_info = Loader::load_gguf_info(model_path.clone(), 0, false)?;
-        range_pop!();
         range_push!("Tokenizer build");
-        let tokenizer = TokenizerServiceBuilder::from_gguf_metadata(&gguf_info.kv_meta)?;
+        let tokenizer = TokenizerService::builder()
+            .with_gguf_metadata(&gguf_info)
+            .build()?;
         range_pop!();
         let device = DeviceManager::select()?;
 
@@ -152,38 +152,35 @@ impl InferenceEngine {
     pub fn generate_chat_stream<F>(
         &mut self,
         messages: &[ChatMessage],
-        max_tokens: usize,
-        temperature: f64,
+        gen_config: GenerationConfig,
         use_flash: bool,
-        mut callback: F,
+        callback: F,
     ) -> anyhow::Result<GenerationReport> 
     where F: FnMut(&str) -> anyhow::Result<()> 
     {
         let prompt = self.tokenizer.apply_chat_template(messages)?;
         debug!("Model prompt: {:?}", prompt);
         let encoding = self.tokenizer.encode(&prompt, false)?;
-        self.generate_from_encoding(encoding, max_tokens, temperature, use_flash, callback)
+        self.generate_from_encoding(encoding, gen_config, use_flash, callback)
     }
 
     pub fn generate_stream<F>(
         &mut self,
         prompt: &str,
-        max_tokens: usize,
-        temperature: f64,
+        gen_config: GenerationConfig,
         use_flash: bool,
-        mut callback: F,
+        callback: F,
     ) -> anyhow::Result<GenerationReport> 
     where F: FnMut(&str) -> anyhow::Result<()> 
     {
         let encoding = self.tokenizer.encode(&prompt, true)?;
-        self.generate_from_encoding(encoding, max_tokens, temperature, use_flash, callback)
+        self.generate_from_encoding(encoding, gen_config, use_flash, callback)
     }
 
     pub fn generate_from_encoding<F>(
         &mut self,
         encoding: Encoding,
-        max_tokens: usize,
-        temperature: f64,
+        gen_config: GenerationConfig,
         use_flash: bool,
         mut callback: F,
     ) -> anyhow::Result<GenerationReport> 
@@ -195,7 +192,7 @@ impl InferenceEngine {
         debug!("Input tokens length: {}", input_tokens_len);
 
         // Initialize logits processor (handles temperature, top-p, etc.)
-        let logits_processor = LogitsProcessor::new(18, Some(temperature), None);
+        let logits_processor = LogitsProcessor::new(gen_config.seed, Some(gen_config.temperature), Some(gen_config.top_p));
 
         let model = self.model.get_or_try_init(|| self.init_model())?;
 
@@ -214,10 +211,10 @@ impl InferenceEngine {
         };
         let mut next_token;
         let mut output_text = String::new();
-        let mut num_tokens = max_tokens;
+        let mut num_tokens = gen_config.max_tokens;
 
         // Autoregressive generation loop
-        for i in 1..max_tokens {
+        for i in 1..gen_config.max_tokens {
             // This handles pre-fill on i=1, and single token generation on i>1
             next_token = self.generate_token(&mut context)?;
 

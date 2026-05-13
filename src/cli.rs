@@ -1,9 +1,11 @@
 use crate::inference::InferenceEngine;
 use crate::gguf::Loader;
-use crate::tokenizer::TokenizerServiceBuilder;
+use crate::tokenizer::{TokenizerServiceBuilder, TokenizerService};
 use crate::session::SessionManager;
+use crate::config::GenerationConfig;
 use candle_core::DType;
 use clap::{Parser, Subcommand};
+use std::rc::Rc;
 use std::{ffi::OsString, str::FromStr};
 use colored::*;
 
@@ -43,10 +45,14 @@ pub enum Commands {
     Generate {
         prompt: String,
         model_path: OsString,
-        #[arg(short = 'm', long = "max_tokens", default_value = "100")]
-        max_tokens: usize,
-        #[arg(short = 't', long = "temperature", default_value = "0.8")]
-        temperature: f32,
+        #[arg(short = 'm', long = "max_tokens")]
+        max_tokens: Option<usize>,
+        #[arg(short = 't', long = "temperature")]
+        temperature: Option<f64>,
+        #[arg(short = 'p', long = "top_p")]
+        top_p: Option<f64>,
+        #[arg(long = "seed")]
+        seed: Option<u64>,
         #[arg(short = 'd', long = "dtype", default_value = "f32")]
         compute_dtype: String,
         #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
@@ -63,10 +69,14 @@ pub enum Commands {
         model_path: OsString,
         #[arg(long = "system_message", default_value = "You are a helpfull assistant.")]
         system_message: String,
-        #[arg(short = 'm', long = "max_tokens", default_value = "100")]
-        max_tokens: usize,
-        #[arg(short = 't', long = "temperature", default_value = "0.8")]
-        temperature: f32,
+        #[arg(short = 'm', long = "max_tokens")]
+        max_tokens: Option<usize>,
+        #[arg(short = 't', long = "temperature")]
+        temperature: Option<f64>,
+        #[arg(short = 'p', long = "top_p")]
+        top_p: Option<f64>,
+        #[arg(long = "seed")]
+        seed: Option<u64>,
         #[arg(short = 'd', long = "dtype", default_value = "f32")]
         compute_dtype: String,
         #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
@@ -96,7 +106,10 @@ pub fn run() -> anyhow::Result<()> {
             let path_str = model_path.to_string_lossy();
             let path_sanitized = path_str.replace('\\', "/");
             let info = Loader::load_gguf_info(path_sanitized, 10, false)?;
-            let tokenizer = TokenizerServiceBuilder::from_gguf_metadata(&info.kv_meta)?;
+
+            let mut tokenizer = TokenizerService::builder()
+                .with_gguf_metadata(&info)
+                .build()?;
             let encoding = tokenizer.encode(&text, true)?;
 
             println!("Input: \"{}\"", text);
@@ -110,6 +123,8 @@ pub fn run() -> anyhow::Result<()> {
             model_path,
             max_tokens,
             temperature,
+            top_p,
+            seed,
             compute_dtype,
             max_seq_len,
             use_flash,
@@ -119,12 +134,25 @@ pub fn run() -> anyhow::Result<()> {
             let path_sanitized = path_str.replace('\\', "/");
             let dtype = DType::from_str(&compute_dtype).map_err(|_|
                 anyhow::anyhow!("Invalid dtype: {}", compute_dtype))?;
+
+            let gguf_info = Loader::load_gguf_info(&path_sanitized, 0, false)?;
+            let info_rc = Rc::clone(&Rc::new(gguf_info));
+
             let mut inference_engine = InferenceEngine::builder()
-                .model_path(&path_sanitized)
+                .with_gguf_metadata(info_rc.clone())
                 .dtype(dtype)
                 .max_seq_len(max_seq_len)
                 .conv_on_cpu(true)
                 .build()?;
+
+            // Resolve generation config with priority: CLI > GGUF metadata > defaults
+            let gen_config = GenerationConfig::builder()
+                .max_tokens(max_tokens)
+                .temperature(temperature)
+                .top_p(top_p)
+                .seed(seed)
+                .with_gguf_metadata(info_rc.clone())?
+                .build();
 
             println!("🦀 Generating: \"{}\"", prompt);
             let start = std::time::Instant::now();
@@ -141,8 +169,7 @@ pub fn run() -> anyhow::Result<()> {
             };
             let report = inference_engine.generate_stream(
                 prompt.as_str(),
-                max_tokens,
-                temperature as f64,
+                gen_config,
                 use_flash,
                 stream_callback,
             )?;
@@ -159,17 +186,30 @@ pub fn run() -> anyhow::Result<()> {
                 report.num_tokens as f64 / report.token_generation_sec,
             );
         },
-        Commands::Chat { prompt, model_path, system_message, max_tokens, temperature, compute_dtype, max_seq_len, use_flash, stream } => {
+        Commands::Chat { prompt, model_path, system_message, max_tokens, temperature, top_p, seed, compute_dtype, max_seq_len, use_flash, stream } => {
             let path_str = model_path.to_string_lossy();
             let path_sanitized = path_str.replace('\\', "/");
             let dtype = DType::from_str(&compute_dtype).map_err(|_|
                 anyhow::anyhow!("Invalid dtype: {}", compute_dtype))?;
+
+            let gguf_info = Loader::load_gguf_info(&path_sanitized, 0, false)?;
+            let info_rc = Rc::clone(&Rc::new(gguf_info));
+
             let mut inference_engine = InferenceEngine::builder()
-                .model_path(&path_sanitized)
+                .with_gguf_metadata(info_rc.clone())
                 .dtype(dtype)
                 .max_seq_len(max_seq_len)
                 .conv_on_cpu(true)
                 .build()?;
+
+            // Resolve generation config with priority: CLI > GGUF metadata > defaults
+            let gen_config = GenerationConfig::builder()
+                .max_tokens(max_tokens)
+                .temperature(temperature)
+                .top_p(top_p)
+                .seed(seed)
+                .with_gguf_metadata(info_rc.clone())?
+                .build();
 
             println!("🦀 Generating: \"{}\"", prompt);
             let start = std::time::Instant::now();
@@ -186,14 +226,13 @@ pub fn run() -> anyhow::Result<()> {
             };
 
             let mut session_manager = SessionManager::new();
-            let mut session = session_manager.start_session(&system_message);
+            let session = session_manager.start_session(&system_message);
             session.add_user_message(&prompt);
             let prompt_templated = session.get_messages();
 
             let report = inference_engine.generate_chat_stream(
                 prompt_templated,
-                max_tokens,
-                temperature as f64,
+                gen_config,
                 use_flash,
                 stream_callback,
             )?;

@@ -3,7 +3,7 @@ use candle_nn::kv_cache::ConcatKvCache;
 use candle_transformers::quantized_var_builder::VarBuilder;
 
 use crate::config::{ModelArchitecture, ModelConfig};
-use crate::model::Lfm2Model;
+use crate::model::{Lfm2Model, Deepseek2Model};
 
 pub trait Model {
     fn forward(
@@ -45,7 +45,9 @@ impl ModelBuilder {
             ModelArchitecture::Lfm2 => {
                 anyhow::Ok(Box::new(Lfm2Model::load(self.config, self.var_builder, self.compute_dtype, self.max_seq_len, self.conv_on_cpu)?))
             }
-            ModelArchitecture::Llama => anyhow::bail!("Not implemented yet"),
+            ModelArchitecture::Deepseek2 => {
+                anyhow::Ok(Box::new(Deepseek2Model::load(self.config, self.var_builder, self.compute_dtype, self.max_seq_len)?))
+            },
         }
     }
 }

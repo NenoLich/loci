@@ -15,6 +15,7 @@ use once_cell::sync::OnceCell;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
+use crate::model::utility::{repeat_kv, get_tensor, find_norm_prefix, RotaryEmbedding};
 use crate::{
     model::{Model, MixedCache},
     config::ModelConfig,
@@ -175,8 +176,6 @@ impl AttentionMixer {
         let k = self.k_norm.forward(&k.to_dtype(DType::F32)?)?;
 
         // 4. Update KV cache and compute attention
-        let k = k.to_dtype(DType::F16)?;
-        let v = v.to_dtype(DType::F16)?;
         let (k, v) = self.update_cache(k, v, cache)?;
 
         range_push!("Compute attn");
@@ -218,7 +217,7 @@ impl AttentionMixer {
     ) -> anyhow::Result<(Tensor, Tensor)> {
         match cache {
             Some(MixedCache::KvCache(kv_cache)) => {
-                kv_cache.append(&k, &v).map_err(anyhow::Error::msg)
+                kv_cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?).map_err(anyhow::Error::msg)
             }
             _ => Ok((k, v)),
         }
@@ -283,8 +282,8 @@ impl AttentionMixer {
 
         // Repeat KV heads for grouped-query attention
         let n_repeat = self.n_heads / self.n_kv_heads;
-        let k = crate::model::utility::repeat_kv(k, n_repeat)?.to_dtype(DType::F32)?;
-        let v = crate::model::utility::repeat_kv(v, n_repeat)?.to_dtype(DType::F32)?;
+        let k = repeat_kv(k, n_repeat)?.to_dtype(DType::F32)?;
+        let v = repeat_kv(v, n_repeat)?.to_dtype(DType::F32)?;
 
         // Compute attention scores: Q @ K.T / sqrt(head_dim)
         let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
@@ -475,7 +474,7 @@ impl ShortConvMixer {
             let new_cache = input_cached.narrow(
                 2,
                 current_len - (self.conv_l_cache - 1),
-                (self.conv_l_cache - 1),
+                self.conv_l_cache - 1,
             )?;
             *cache = Some(MixedCache::ConvCache(new_cache));
 
@@ -511,7 +510,7 @@ impl ShortConvMixer {
 
         // Update cache with the last pad_len tokens for future decode steps
         if seq_len >= pad_len {
-            let new_cache = input.narrow(2, seq_len - (self.conv_l_cache - 1), (self.conv_l_cache - 1))?;
+            let new_cache = input.narrow(2, seq_len - (self.conv_l_cache - 1), self.conv_l_cache - 1)?;
             *cache = Some(MixedCache::ConvCache(new_cache));
         }
 
@@ -657,10 +656,10 @@ impl Lfm2Model {
 
         // Load embeddings (shared between input and output if no separate output.weight)
         let embed_tensor =
-            Self::get_tensor("token_embd.weight", var_builder.clone(), compute_dtype)?;
+            get_tensor("token_embd.weight", var_builder.clone(), compute_dtype)?;
 
         let lm_head_tensor = if var_builder.contains_key("output.weight") {
-            Self::get_tensor("output.weight", var_builder.clone(), compute_dtype)?
+            get_tensor("output.weight", var_builder.clone(), compute_dtype)?
         } else {
             embed_tensor.clone()
         };
@@ -669,14 +668,16 @@ impl Lfm2Model {
         let lm_head = Linear::new(lm_head_tensor, None);
 
         // Load embedding normalization
+        let embed_norm_prefix = find_norm_prefix(var_builder.clone());
         let embed_norm =
-            RmsNorm::new(hidden_size, rms_epsilon, var_builder.pp("token_embd_norm"))?;
+            RmsNorm::new(hidden_size, rms_epsilon, var_builder.pp(embed_norm_prefix))?;
 
         // Initialize rotary position embeddings
         let rope = Arc::new(RotaryEmbedding::new(
             config.rope_theta,
             head_dim,
             effective_max_seq_len,
+            false,
             device,
         )?);
 
@@ -690,6 +691,7 @@ impl Lfm2Model {
                     i,
                     rope_clone.clone(),
                     &config,
+                    effective_max_seq_len,
                     compute_dtype,
                     conv_on_cpu,
                 )
@@ -713,6 +715,7 @@ impl Lfm2Model {
         block_index: usize,
         rope: Arc<RotaryEmbedding>,
         config: &ModelConfig,
+        effective_max_seq_len: usize,
         compute_dtype: DType,
         conv_on_cpu: bool,
     ) -> anyhow::Result<Lfm2Layer> {
@@ -740,7 +743,7 @@ impl Lfm2Model {
                 head_dim,
                 config.n_heads,
                 n_kv_heads,
-                config.max_seq_len,
+                effective_max_seq_len,
                 rms_epsilon,
                 compute_dtype,
             )?)
@@ -748,7 +751,7 @@ impl Lfm2Model {
             Lfm2Mixer::ShortConv(Self::load_conv_mixer(
                 &var_builder,
                 conv_device,
-                config.conv_l_cache,
+                config.conv_l_cache.unwrap_or(3),
                 conv_on_cpu,
                 compute_dtype,
             )?)
@@ -776,25 +779,25 @@ impl Lfm2Model {
         head_dim: usize,
         n_heads: usize,
         n_kv_heads: usize,
-        max_seq_len: usize,
+        effective_max_seq_len: usize,
         rms_epsilon: f64,
         compute_dtype: DType,
     ) -> anyhow::Result<AttentionMixer> {
         Ok(AttentionMixer {
             q_proj: Linear::new(
-                Self::get_tensor("attn_q.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("attn_q.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             k_proj: Linear::new(
-                Self::get_tensor("attn_k.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("attn_k.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             v_proj: Linear::new(
-                Self::get_tensor("attn_v.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("attn_v.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             o_proj: Linear::new(
-                Self::get_tensor("attn_output.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("attn_output.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             q_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_q_norm"))?,
@@ -804,7 +807,7 @@ impl Lfm2Model {
             head_dim,
             n_heads,
             n_kv_heads,
-            max_seq_len,
+            max_seq_len: effective_max_seq_len,
         })
     }
 
@@ -832,12 +835,12 @@ impl Lfm2Model {
 
         Ok(ShortConvMixer {
             in_proj: Linear::new(
-                Self::get_tensor("shortconv.in_proj.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("shortconv.in_proj.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             conv: Conv1d::new(conv_weights, None, conv_cfg),
             out_proj: Linear::new(
-                Self::get_tensor("shortconv.out_proj.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("shortconv.out_proj.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             conv_l_cache,
@@ -850,142 +853,20 @@ impl Lfm2Model {
     fn load_ffn(var_builder: &VarBuilder, compute_dtype: DType) -> anyhow::Result<Lfm2Ffn> {
         Ok(Lfm2Ffn {
             up_proj: Linear::new(
-                Self::get_tensor("ffn_up.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("ffn_up.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             gate_proj: Linear::new(
-                Self::get_tensor("ffn_gate.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("ffn_gate.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             down_proj: Linear::new(
-                Self::get_tensor("ffn_down.weight", var_builder.clone(), compute_dtype)?,
+                get_tensor("ffn_down.weight", var_builder.clone(), compute_dtype)?,
                 None,
             ),
             compute_dtype,
         })
     }
-
-    /// Load a tensor from the GGUF model and convert to the target compute dtype.
-    ///
-    /// Handles quantized tensors (Q4, Q8, etc.) and converts them to the
-    /// appropriate compute dtype (F16, BF16, or F32) with optimized paths.
-    fn get_tensor(
-        tensor_name: &str,
-        var_builder: VarBuilder,
-        compute_dtype: DType,
-    ) -> anyhow::Result<Tensor> {
-        let q_tensor = var_builder.get_no_shape(tensor_name)?;
-        let device = var_builder.device();
-
-        let weight = match (q_tensor.dtype(), compute_dtype) {
-            // Target is F32: always dequantize to F32
-            (_, DType::F32) => q_tensor.dequantize(device)?,
-
-            // Source is already float: dequantize and cast
-            (GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32, _) => {
-                q_tensor.dequantize(device)?.to_dtype(compute_dtype)?
-            }
-
-            // Quantized source to F16: use fast dequantize path
-            (_, DType::F16) => q_tensor.dequantize_f16(device)?,
-
-            // All other cases: dequantize to F32 then cast
-            _ => q_tensor.dequantize(device)?.to_dtype(compute_dtype)?,
-        };
-
-        Ok(weight)
-    }
 }
 
-/// Rotary Position Embeddings (RoPE) for LFM2.
-///
-/// RoPE encodes position information by rotating query and key vectors
-/// in the complex plane. This implementation precomputes sine and cosine
-/// tables for all positions up to `max_seq_len`.
-pub struct RotaryEmbedding {
-    /// Precomputed cosine values for all positions
-    cos: Tensor,
-    /// Precomputed sine values for all positions
-    sin: Tensor,
-}
 
-impl RotaryEmbedding {
-    /// Create a new RotaryEmbedding instance.
-    ///
-    /// # Arguments
-    /// * `rope_theta` - Base frequency for RoPE (typically 10000.0)
-    /// * `head_dim` - Dimension of each attention head
-    /// * `max_seq_len` - Maximum sequence length to precompute
-    /// * `device` - Device to store the precomputed tables
-    pub fn new(
-        rope_theta: f32,
-        head_dim: usize,
-        max_seq_len: usize,
-        device: &Device,
-    ) -> anyhow::Result<Self> {
-        // 1. Generate inverse frequencies: theta_i = 1.0 / (base ^ (2i / dim))
-        let freqs: Vec<_> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1.0 / (rope_theta as f64).powf(i as f64 / head_dim as f64))
-            .collect();
-        let freqs = Tensor::new(freqs, device)?.to_dtype(candle_core::DType::F32)?;
-
-        // 2. Create position indices [0, 1, 2, ..., max_seq_len]
-        let positions =
-            Tensor::arange(0u32, max_seq_len as u32, device)?.to_dtype(candle_core::DType::F32)?;
-
-        // 3. Compute outer product: [max_seq_len, 1] × [1, head_dim/2] -> [max_seq_len, head_dim/2]
-        let freqs = positions
-            .reshape((max_seq_len, 1))?
-            .matmul(&freqs.reshape((1, freqs.dims1()?))?)?;
-
-        // 4. Duplicate to get [max_seq_len, head_dim] (since we computed for half)
-        let freqs = Tensor::cat(&[&freqs, &freqs], 1)?;
-
-        Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
-        })
-    }
-
-    /// Apply rotary position embeddings to a tensor.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape [batch, heads, seq_len, head_dim]
-    /// * `pos` - Starting position in the sequence
-    ///
-    /// # Returns
-    /// Tensor with RoPE applied, same shape as input
-    pub fn forward(&self, x: &Tensor, pos: usize) -> anyhow::Result<Tensor> {
-        let original_dtype = x.dtype();
-        let (_batch, _heads, seq_len, head_dim) = x.dims4()?;
-
-        // Slice sine and cosine for the current position range
-        let cos = self
-            .cos
-            .narrow(0, pos, seq_len)?
-            .reshape((1, 1, seq_len, head_dim))?;
-        let sin = self
-            .sin
-            .narrow(0, pos, seq_len)?
-            .reshape((1, 1, seq_len, head_dim))?;
-
-        // Convert to F32 for rotation math
-        let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-
-        // Standard RoPE: x_rotated = x*cos + rotate_half(x)*sin
-        // rotate_half([x1, x2]) -> [-x2, x1]
-        let half_dim = head_dim / 2;
-        let x1 = x_f32.narrow(candle_core::D::Minus1, 0, half_dim)?;
-        let x2 = x_f32.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
-        let x_rotated = Tensor::cat(&[&x2.neg()?, &x1], candle_core::D::Minus1)?;
-
-        // Apply rotation: x*cos + rotated_x*sin
-        let rotated = (x_f32.broadcast_mul(&cos)? + x_rotated.broadcast_mul(&sin)?)?;
-
-        // Cast back to original dtype
-        rotated
-            .to_dtype(original_dtype)
-            .map_err(anyhow::Error::msg)
-    }
-}

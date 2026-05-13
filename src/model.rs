@@ -1,6 +1,6 @@
-mod lfm2_model;
 mod utility;
 mod model;
+mod model_impls;
 
-pub use self::lfm2_model::Lfm2Model;
+pub use self::model_impls::{Lfm2Model, Deepseek2Model};
 pub use self::model::{MixedCache, Model, ModelBuilder};

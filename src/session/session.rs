@@ -70,6 +70,5 @@ impl Session {
 
     pub fn add_tool_message(&mut self, message: impl Into<String>) {
         self.add_message(Role::Tool, message);
-        use crate::session::SessionManager;
     }
 }
