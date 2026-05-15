@@ -4,7 +4,7 @@ use crate::tokenizer::{TokenizerServiceBuilder, TokenizerService};
 use crate::session::SessionManager;
 use crate::config::GenerationConfig;
 use candle_core::DType;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::rc::Rc;
 use std::{ffi::OsString, str::FromStr};
 use colored::*;
@@ -53,8 +53,8 @@ pub enum Commands {
         top_p: Option<f64>,
         #[arg(long = "seed")]
         seed: Option<u64>,
-        #[arg(short = 'd', long = "dtype", default_value = "f32")]
-        compute_dtype: String,
+        #[arg(short = 'd', long = "dtype", value_enum, default_value_t = ComputeDtype::F32)]
+        compute_dtype: ComputeDtype,
         #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
         max_seq_len: usize,
         #[arg(short = 'f', long = "use_flash")]
@@ -77,8 +77,8 @@ pub enum Commands {
         top_p: Option<f64>,
         #[arg(long = "seed")]
         seed: Option<u64>,
-        #[arg(short = 'd', long = "dtype", default_value = "f32")]
-        compute_dtype: String,
+        #[arg(short = 'd', long = "dtype", value_enum, default_value_t = ComputeDtype::F32)]
+        compute_dtype: ComputeDtype,
         #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
         max_seq_len: usize,
         #[arg(short = 'f', long = "use_flash")]
@@ -87,6 +87,12 @@ pub enum Commands {
         stream: bool,
     }
     
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+enum ComputeDtype {
+    F32,
+    F16
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -132,8 +138,10 @@ pub fn run() -> anyhow::Result<()> {
         } => {
             let path_str = model_path.to_string_lossy();
             let path_sanitized = path_str.replace('\\', "/");
-            let dtype = DType::from_str(&compute_dtype).map_err(|_|
-                anyhow::anyhow!("Invalid dtype: {}", compute_dtype))?;
+            let dtype = match compute_dtype {
+                ComputeDtype::F16 => DType::F16,
+                ComputeDtype::F32 => DType::F32,
+            };
 
             let gguf_info = Loader::load_gguf_info(&path_sanitized, 0, false)?;
             let info_rc = Rc::clone(&Rc::new(gguf_info));
@@ -189,8 +197,10 @@ pub fn run() -> anyhow::Result<()> {
         Commands::Chat { prompt, model_path, system_message, max_tokens, temperature, top_p, seed, compute_dtype, max_seq_len, use_flash, stream } => {
             let path_str = model_path.to_string_lossy();
             let path_sanitized = path_str.replace('\\', "/");
-            let dtype = DType::from_str(&compute_dtype).map_err(|_|
-                anyhow::anyhow!("Invalid dtype: {}", compute_dtype))?;
+            let dtype = match compute_dtype {
+                ComputeDtype::F16 => DType::F16,
+                ComputeDtype::F32 => DType::F32,
+            };
 
             let gguf_info = Loader::load_gguf_info(&path_sanitized, 0, false)?;
             let info_rc = Rc::clone(&Rc::new(gguf_info));

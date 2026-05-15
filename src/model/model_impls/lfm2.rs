@@ -1,21 +1,20 @@
-use candle_core::quantized::GgmlDType;
+use candle_core::quantized::{GgmlDType, QMatMul};
 use candle_core::{DType, Device, Tensor};
 #[cfg(feature = "cuda")]
 use candle_flash_attn::flash_attn;
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::{
-    Linear, Embedding,
     Conv1d, Conv1dConfig, Module,
     ops::{silu, softmax},
 };
 use nvtx::{range, range_push, range_pop};
-use candle_transformers::quantized_nn::RmsNorm;
+use candle_transformers::quantized_nn::{RmsNorm, Embedding};
 use candle_transformers::quantized_var_builder::VarBuilder;
 use once_cell::sync::OnceCell;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
-use crate::model::utility::{repeat_kv, get_tensor, find_norm_prefix, RotaryEmbedding};
+use crate::model::utility::{repeat_kv, get_tensor, find_norm_prefix, qmatmul_forward, RotaryEmbedding};
 use crate::{
     model::{Model, MixedCache},
     config::ModelConfig,
@@ -34,7 +33,7 @@ pub struct Lfm2Model {
     /// Transformer layers (typically 16 blocks)
     pub layers: Vec<Lfm2Layer>,
     /// Output projection layer (output.weight)
-    pub lm_head: Linear,
+    pub lm_head: QMatMul,
     /// Data type used for computations (F16, BF16, or F32)
     pub compute_dtype: DType,
 }
@@ -116,13 +115,13 @@ pub enum Lfm2Mixer {
 /// which is specific to LFM2.
 pub struct AttentionMixer {
     /// Query projection (blk.N.attn_q.weight)
-    q_proj: Linear,
+    q_proj: QMatMul,
     /// Key projection (blk.N.attn_k.weight)
-    k_proj: Linear,
+    k_proj: QMatMul,
     /// Value projection (blk.N.attn_v.weight)
-    v_proj: Linear,
+    v_proj: QMatMul,
     /// Output projection (blk.N.attn_output.weight)
-    o_proj: Linear,
+    o_proj: QMatMul,
     /// Query normalization (blk.N.attn_q_norm) - LFM2 specific
     q_norm: RmsNorm,
     /// Key normalization (blk.N.attn_k_norm) - LFM2 specific
@@ -184,14 +183,14 @@ impl AttentionMixer {
 
         // 5. Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
         let y = y.reshape((batch_size, seq_len, self.head_dim * self.n_heads))?;
-        Ok(self.o_proj.forward(&y)?)
+        Ok(qmatmul_forward(&self.o_proj, &y)?)
     }
 
     /// Project input to query, key, and value tensors with head dimensions.
     fn project_qkv(&self, x: &Tensor) -> anyhow::Result<(Tensor, Tensor, Tensor)> {
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = qmatmul_forward(&self.q_proj, x)?;
+        let k = qmatmul_forward(&self.k_proj, x)?;
+        let v = qmatmul_forward(&self.v_proj, x)?;
 
         let (batch_size, seq_len, _) = q.dims3()?;
 
@@ -343,11 +342,11 @@ impl AttentionMixer {
 /// incremental decoding.
 pub struct ShortConvMixer {
     /// Input projection that splits into B, C, H (gate, gate, signal)
-    in_proj: Linear,
+    in_proj: QMatMul,
     /// Depth-wise 1D convolution (groups = channels)
     conv: Conv1d,
     /// Output projection
-    out_proj: Linear,
+    out_proj: QMatMul,
     /// Cache length for convolution state
     conv_l_cache: usize,
     /// Convolution kernel size
@@ -375,13 +374,13 @@ impl ShortConvMixer {
         let (batch_size, seq_len, hidden_size) = input.dims3()?;
 
         // 1. Project input to [B, S, 3 * hidden_size] and split into gates and signal
-        let projected = self.in_proj.forward(&input.to_dtype(compute_dtype)?)?;
+        let projected = qmatmul_forward(&self.in_proj, &input.to_dtype(compute_dtype)?)?;
         let chunks = projected.chunk(3, 2)?;
         let (b_gate, c_gate, h_signal) = match &chunks[..] {
             [b, c, h] => (b, c, h),
             _ => unreachable!("chunk(3, 2) always returns 3 tensors"),
         };
-
+        
         // 2. First gating: y = B ⊙ h
         let gated = (b_gate * h_signal)?;
 
@@ -394,7 +393,7 @@ impl ShortConvMixer {
         let gated_output = (c_gate * conv_out)?;
 
         // 5. Output projection
-        Ok(self.out_proj.forward(&gated_output)?)
+        Ok(qmatmul_forward(&self.out_proj, &gated_output)?)
     }
 
     /// Perform convolution with caching support.
@@ -528,11 +527,11 @@ impl ShortConvMixer {
 /// then cast back to the compute dtype.
 pub struct Lfm2Ffn {
     /// Up projection (blk.N.ffn_up)
-    pub up_proj: Linear,
+    pub up_proj: QMatMul,
     /// Gate projection with SwiGLU activation (blk.N.ffn_gate)
-    pub gate_proj: Linear,
+    pub gate_proj: QMatMul,
     /// Down projection (blk.N.ffn_down)
-    pub down_proj: Linear,
+    pub down_proj: QMatMul,
     /// Data type used for computations
     pub compute_dtype: DType,
 }
@@ -549,15 +548,15 @@ impl Lfm2Ffn {
         let input = input.to_dtype(self.compute_dtype)?;
 
         // 1. Up and gate projections
-        let up = self.up_proj.forward(&input)?;
-        let gate = self.gate_proj.forward(&input)?;
+        let up = qmatmul_forward(&self.up_proj, &input)?;
+        let gate = qmatmul_forward(&self.gate_proj, &input)?;
 
         // 2. SwiGLU activation: silu(gate) * up (computed in F32 for stability)
         let gate_activated = silu(&gate.to_dtype(DType::F32)?)?;
         let gated = (gate_activated.to_dtype(self.compute_dtype)? * up)?;
 
         // 3. Down projection
-        Ok(self.down_proj.forward(&gated)?)
+        Ok(qmatmul_forward(&self.down_proj, &gated)?)
     }
 }
 
@@ -581,7 +580,7 @@ impl Model for Lfm2Model {
     ) -> anyhow::Result<Tensor> {
         // 1. Token embeddings
         range_push!("Embed step");
-        let mut x = self.embed_layer.forward(input)?;
+        let mut x = self.embed_layer.forward(input)?.to_dtype(self.compute_dtype)?;
         range_pop!();
 
         // 2. Transformer layers
@@ -598,8 +597,8 @@ impl Model for Lfm2Model {
         range_pop!();
 
         // 3. Final normalization and output projection
-        let x = self.embed_norm.forward(&x.to_dtype(DType::F32)?)?;
-        let logits = self.lm_head.forward(&x.to_dtype(self.compute_dtype)?)?;
+        let final_norm = self.embed_norm.forward(&x.to_dtype(DType::F32)?)?;
+        let logits = qmatmul_forward(&self.lm_head, &final_norm.to_dtype(self.compute_dtype)?)?;
 
         Ok(logits)
     }
@@ -648,6 +647,7 @@ impl Lfm2Model {
         let hidden_size = config.hidden_size;
         let n_layers = config.n_layers;
         let n_heads = config.n_heads;
+        let vocab_size = config.vocab_size;
         let head_dim = hidden_size / n_heads;
         let device = var_builder.device();
 
@@ -655,17 +655,14 @@ impl Lfm2Model {
         let effective_max_seq_len = config.max_seq_len.min(requested_max_seq_len);
 
         // Load embeddings (shared between input and output if no separate output.weight)
-        let embed_tensor =
-            get_tensor("token_embd.weight", var_builder.clone(), compute_dtype)?;
-
         let lm_head_tensor = if var_builder.contains_key("output.weight") {
-            get_tensor("output.weight", var_builder.clone(), compute_dtype)?
+            var_builder.get_no_shape("output.weight")?
         } else {
-            embed_tensor.clone()
+            var_builder.get_no_shape("token_embd.weight")?
         };
 
-        let embed_layer = Embedding::new(embed_tensor, hidden_size);
-        let lm_head = Linear::new(lm_head_tensor, None);
+        let embed_layer = Embedding::new(vocab_size, hidden_size, var_builder.pp("token_embd"))?;
+        let lm_head = QMatMul::from_arc(lm_head_tensor)?;
 
         // Load embedding normalization
         let embed_norm_prefix = find_norm_prefix(var_builder.clone());
@@ -784,22 +781,18 @@ impl Lfm2Model {
         compute_dtype: DType,
     ) -> anyhow::Result<AttentionMixer> {
         Ok(AttentionMixer {
-            q_proj: Linear::new(
-                get_tensor("attn_q.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            k_proj: Linear::new(
-                get_tensor("attn_k.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            v_proj: Linear::new(
-                get_tensor("attn_v.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            o_proj: Linear::new(
-                get_tensor("attn_output.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
+            q_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_q.weight")?,
+            )?,
+            k_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_k.weight")?,
+            )?,
+            v_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_v.weight")?,
+            )?,
+            o_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_output.weight")?,
+            )?,
             q_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_q_norm"))?,
             k_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_k_norm"))?,
             rope,
@@ -834,15 +827,13 @@ impl Lfm2Model {
             .unsqueeze(1)?;
 
         Ok(ShortConvMixer {
-            in_proj: Linear::new(
-                get_tensor("shortconv.in_proj.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
+            in_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("shortconv.in_proj.weight")?,
+            )?,
             conv: Conv1d::new(conv_weights, None, conv_cfg),
-            out_proj: Linear::new(
-                get_tensor("shortconv.out_proj.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
+            out_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("shortconv.out_proj.weight")?,
+            )?,
             conv_l_cache,
             kernel_size,
             conv_on_cpu,
@@ -852,18 +843,15 @@ impl Lfm2Model {
     /// Load FFN (feed-forward network) for a layer.
     fn load_ffn(var_builder: &VarBuilder, compute_dtype: DType) -> anyhow::Result<Lfm2Ffn> {
         Ok(Lfm2Ffn {
-            up_proj: Linear::new(
-                get_tensor("ffn_up.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            gate_proj: Linear::new(
-                get_tensor("ffn_gate.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            down_proj: Linear::new(
-                get_tensor("ffn_down.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
+            up_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_up.weight")?,
+            )?,
+            gate_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_gate.weight")?,
+            )?,
+            down_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_down.weight")?,
+            )?,
             compute_dtype,
         })
     }

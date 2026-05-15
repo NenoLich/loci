@@ -1,27 +1,29 @@
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Embedding, Linear, Module};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use candle_nn::Module;
 use candle_nn::ops::{softmax, silu, sigmoid};
 use candle_nn::kv_cache::ConcatKvCache;
-use candle_transformers::quantized_nn::RmsNorm;
+use candle_transformers::quantized_nn::{RmsNorm, Embedding};
 use candle_transformers::quantized_var_builder::VarBuilder;
 
 #[cfg(feature = "cuda")]
 use candle_flash_attn::flash_attn;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use tracing::debug;
 use nvtx::{range, range_push, range_pop};
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
 
 use crate::model::{Model, MixedCache};
-use crate::model::utility::{get_tensor, find_norm_prefix, repeat_kv, nonzero_1d, RotaryEmbedding};
+use crate::model::utility::{get_tensor, find_norm_prefix, repeat_kv, nonzero_1d, qmatmul_forward, RotaryEmbedding};
 use crate::config::ModelConfig;
 
 pub struct Deepseek2Model {
     embed_layer: Embedding,
     layers: Vec<Deepseek2Layer>,
     embed_norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: QMatMul,
     compute_dtype: DType,
 }
 
@@ -42,7 +44,9 @@ impl Deepseek2Layer {
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         // 1. Attention with pre-norm and residual
-        let x = self.attn_norm.forward(&input.to_dtype(DType::F32)?)?;
+
+        let input = input.to_dtype(DType::F32)?;
+        let x = self.attn_norm.forward(&input)?;
         
         let attn = self.attention.forward(&x, cache, pos, compute_dtype, use_flash)?;
 
@@ -63,14 +67,14 @@ impl Deepseek2Layer {
 }
 
 pub struct Deepseek2Attn {
-    q_compression: Linear,
+    q_compression: QMatMul,
     q_norm: RmsNorm,
-    q_decompression: Linear,
-    kv_compression: Linear,
+    q_decompression: QMatMul,
+    kv_compression: QMatMul,
     kv_norm: RmsNorm,
-    k_decompression: Linear,
-    v_decompression: Linear,
-    o_proj: Linear,
+    k_decompression_raw: Arc<QTensor>,
+    v_decompression_raw: Arc<QTensor>,
+    o_proj: QMatMul,
     rope: Arc<RotaryEmbedding>,
     rope_dim: usize,
     n_heads: usize,
@@ -95,9 +99,9 @@ impl Deepseek2Attn {
         let x = x.to_dtype(compute_dtype)?;
         let (b, s, _) = x.dims3()?;
 
-        let q = self.q_compression.forward(&x)?;
-        let q = self.q_norm.forward(&q.to_dtype(DType::F32)?)?; // q_a_layernorm
-        let q = self.q_decompression.forward(&q.to_dtype(compute_dtype)?)?; // q_b_proj
+        let q = qmatmul_forward(&self.q_compression, &x)?;
+        let q = self.q_norm.forward(&q.to_dtype(DType::F32)?)?;
+        let q = qmatmul_forward(&self.q_decompression, &q.to_dtype(compute_dtype)?)?;
         let q = q.reshape((b, s, self.n_heads, self.qk_head_dim))?.transpose(1, 2)?;
 
         // Split Query into NoPE and RoPE 
@@ -106,41 +110,56 @@ impl Deepseek2Attn {
             q.narrow(candle_core::D::Minus1, self.qk_nope_head_dim, self.rope_dim)?
         );
         let q_rot_applied = self.rope.forward_interleaved(&q_rot, pos)?;
-        let q_states = Tensor::cat(&[q_pass, q_rot_applied], candle_core::D::Minus1)?;
+        let q_states = Tensor::cat(&[q_pass, q_rot_applied], candle_core::D::Minus1)?.contiguous()?;
 
-        let compressed_kv = self.kv_compression.forward(&x)?;
+        let compressed_kv = qmatmul_forward(&self.kv_compression, &x)?;
         let (kv_latent, k_rot) = (
             compressed_kv.narrow(candle_core::D::Minus1, 0, self.kv_lora_rank)?, 
             compressed_kv.narrow(candle_core::D::Minus1, self.kv_lora_rank, self.rope_dim)?
         );         
 
-        let kv_latent_norm = self.kv_norm.forward(&kv_latent.to_dtype(DType::F32)?)?; 
+        let kv_latent_norm = self.kv_norm.forward(&kv_latent.to_dtype(DType::F32)?.contiguous()?)?.to_dtype(compute_dtype)?; 
 
-        // Project the shared latent to get unique NOPE parts for K and V
-        let k_nope = self.k_decompression.forward(&kv_latent_norm.to_dtype(compute_dtype)?)?; // [b, s, 20 * 192]
-        let value_states = self.v_decompression.forward(&kv_latent_norm.to_dtype(compute_dtype)?)?; // [b, s, 20 * 256]
+        // Shapes: k_weights_raw = [20, 512, 192], v_weights_raw = [20, 256, 512]
+        let k_weights_raw = self.k_decompression_raw.dequantize(kv_latent_norm.device())?; 
+        let v_weights_raw = self.v_decompression_raw.dequantize(kv_latent_norm.device())?; 
 
-        // Reshape and Transpose to (Batch, Heads, Seq, Dim)
-        let k_nope = k_nope.reshape((b, s, self.n_kv_heads, self.qk_nope_head_dim))?.transpose(1, 2)?;
-        let value_states = value_states.reshape((b, s, self.n_kv_heads, self.v_head_dim))?.transpose(1, 2)?;
+        // 2. Add outer batch dimensions
+        let k_weights_batched = k_weights_raw.unsqueeze(0)?; // [1, 20, 512, 192]
+        let v_weights_batched = v_weights_raw.unsqueeze(0)?; // [1, 20, 256, 512]
+
+        // 3. Broadcast hidden states across heads
+        let kv_latent_norm_batched = kv_latent_norm.unsqueeze(1)?; 
+        let kv_latent_norm_broadcasted = kv_latent_norm_batched.broadcast_as((b, self.n_heads, s, 512))?;
+
+        let k_nope = kv_latent_norm_broadcasted
+            .matmul(&k_weights_batched)? // Results in [1, 20, S, 192]
+            .contiguous()?;
+
+        let value_states = kv_latent_norm_broadcasted
+            .matmul(&v_weights_batched.transpose(2, 3)?)? // Results in [1, 20, S, 256]
+            .contiguous()?;
 
         // Assemble the full Key (Key = K_nope + K_rope)
-        let k_rot = k_rot.reshape((b, 1, s, self.rope_dim))?.transpose(1, 2)?; 
+        let k_rot = k_rot.reshape((b, s, 1, self.rope_dim))?.transpose(1, 2)?.contiguous()?;
         let k_rot_applied = self.rope.forward_interleaved(&k_rot, pos)?;
         let key_states = Tensor::cat(&[
             k_nope, 
             k_rot_applied.broadcast_as((b, self.n_kv_heads, s, self.rope_dim))?
-        ], candle_core::D::Minus1)?;
+        ], candle_core::D::Minus1)?
+        .contiguous()?;
 
         let (k_states, v_states) = self.update_cache(key_states, value_states, cache)?;
+        let k_states = k_states.contiguous()?;
+        let v_states = v_states.contiguous()?;
 
         range_push!("Compute attn");
         let attn = self.compute_attention(q_states, k_states, v_states, compute_dtype, use_flash)?;
         range_pop!();
 
         // Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
-        let attn = attn.reshape((b, s, self.v_head_dim * self.n_heads))?;
-        Ok(self.o_proj.forward(&attn)?)
+        let attn = attn.reshape((b, s, self.v_head_dim * self.n_heads))?.contiguous()?;
+        Ok(qmatmul_forward(&self.o_proj, &attn)?)
     }
 
     /// Update KV cache with new keys and values.
@@ -284,9 +303,9 @@ pub enum Deepseek2FfnMixer {
 
 
 pub struct DenseMixer {
-    up_proj: Linear,
-    gate_proj: Linear,
-    down_proj: Linear,
+    up_proj: QMatMul,
+    gate_proj: QMatMul,
+    down_proj: QMatMul,
     compute_dtype: DType,
 }
 
@@ -295,24 +314,25 @@ impl DenseMixer {
         let input = input.to_dtype(self.compute_dtype)?;
 
         // 1. Up and gate projections
-        let up = self.up_proj.forward(&input)?;
-        let gate = self.gate_proj.forward(&input)?;
+        let up = qmatmul_forward(&self.up_proj, &input)?;
+        let gate = qmatmul_forward(&self.gate_proj, &input)?;
 
         // 2. SwiGLU activation: silu(gate) * up (computed in F32 for stability)
         let gate_activated = silu(&gate.to_dtype(DType::F32)?)?;
         let gated = (gate_activated.to_dtype(self.compute_dtype)? * up)?;
 
         // 3. Down projection
-        Ok(self.down_proj.forward(&gated)?)       
+        Ok(qmatmul_forward(&self.down_proj, &gated)?)       
     }
 }
 
 pub struct MoeMixer {
-    gate_inp: Linear,
+    gate_inp: QMatMul,
     e_score_correction: Tensor,
     shared_mlp: DenseMixer,
-    expert_gate_up: Tensor,        // blk.N.ffn_gate_exps + ffn_up_exps (cat these)
-    expert_down: Tensor,           // blk.N.ffn_down_exps
+    expert_up_raw: Arc<QTensor>, 
+    expert_gate_raw: Arc<QTensor>, 
+    expert_down_raw: Arc<QTensor>,          
     n_experts: usize,              // 64
     n_expert_used: usize,          // 4 (top_k)
     n_group: usize,                // 1
@@ -326,18 +346,25 @@ impl MoeMixer {
     fn forward(&self, input: &Tensor) -> anyhow::Result<Tensor> {
         let (b, s, h) = input.dims3()?;
 
-        // Shared Expert (Standard MLP)
+        // 1. Shared Expert Path (Expects 3D sequence inputs normally)
         let shared_out = self.shared_mlp.forward(input)?;
 
-        // Gate routing
-        let router_logits = self.gate_inp.forward(input)?;
-
-        let (topk_indices, topk_weights) = self.route_tokens_to_experts(&router_logits)?;
-
+        // 2. CRITICAL FIX: Flatten 3D inputs to 2D matrix immediately 
+        // [Batch, Seq, Hidden] -> [Batch * Seq, Hidden]
         let x_flat = input.reshape((b * s, h))?.to_dtype(self.compute_dtype)?;
 
+        // 3. Gate routing (Now safely receives a 2D matrix input)
+        // Output will be 2D: [Batch * Seq, n_experts] -> [6, 64]
+        let router_logits = self.gate_inp.forward(&x_flat)?;
+
+        // 4. Evaluate Top-K selection routing
+        // This will now find dims2() correctly without any rank crashes
+        let (topk_indices, topk_weights) = self.route_tokens_to_experts(&router_logits)?;
+
+        // 5. Execute hardware-accelerated MoE loops
         let final_routed = self.experts_forward(&x_flat, topk_indices, topk_weights)?;
 
+        // 6. Combine tracks back into 3D geometry and return
         Ok((shared_out + final_routed.reshape((b, s, h)))?)
 
     }
@@ -345,7 +372,7 @@ impl MoeMixer {
     fn route_tokens_to_experts(&self, router_logits: &Tensor) -> anyhow::Result<(Tensor, Tensor)> {
         // Sigmoid and apply bias
         let router_logits = sigmoid(router_logits)?;
-        let router_logits_for_choice = router_logits.broadcast_add(&self.e_score_correction)?;
+        let router_logits_for_choice = router_logits.broadcast_add(&self.e_score_correction)?.contiguous()?;
 
         // Group Scores Calculation
         let (tokens, _) = router_logits_for_choice.dims2()?;
@@ -377,16 +404,25 @@ impl MoeMixer {
             .expand((tokens, self.n_group, experts_per_group))?
             .reshape((tokens, self.n_experts))?;
 
+        let score_mask_bool = score_mask.to_dtype(candle_core::DType::U8)?;
+
+        let neg_inf_tensor = Tensor::full(
+            f32::NEG_INFINITY, 
+            router_logits_for_choice.shape(), 
+            router_logits_for_choice.device()
+        )?.to_dtype(router_logits_for_choice.dtype())?;
+
         // Masked Fill
-        let scores_for_choice = score_mask.where_cond(
+        let scores_for_choice = score_mask_bool.where_cond(
             &router_logits_for_choice, 
-            &Tensor::full(f32::NEG_INFINITY, router_logits_for_choice.shape(), router_logits_for_choice.device())?
+            &neg_inf_tensor
         )?;
 
         // Get TopK Indices for Experts
         let topk_indices = scores_for_choice
             .arg_sort_last_dim(false)?
-            .narrow(candle_core::D::Minus1, 0, self.n_expert_used)?;
+            .narrow(candle_core::D::Minus1, 0, self.n_expert_used)?
+            .contiguous()?;
 
         // Gather Weights
         let mut topk_weights = router_logits.gather(&topk_indices, candle_core::D::Minus1)?;
@@ -403,53 +439,62 @@ impl MoeMixer {
     }
 
     fn experts_forward(&self, input: &Tensor, topk_indices: Tensor, topk_weights: Tensor) -> anyhow::Result<Tensor> {
-        let mut final_hidden_states = Tensor::zeros_like(&input)?;
+        let (tokens, top_k) = topk_indices.dims2()?;
+        let hidden_dim = input.dim(1)?;
 
-        // 1. One-hot and Masking
-        let expert_mask = Tensor::zeros((topk_indices.dims()[0], topk_indices.dims()[1], self.n_experts), self.compute_dtype, input.device())?
-            .scatter_add(&topk_indices, &Tensor::ones_like(&topk_indices)?, 2)?;
-        
-        // 2. Identify active experts
-        let mask_sum = expert_mask.sum_keepdim(0)?.sum_keepdim(1)?.flatten_all()?;
-        let expert_indices = mask_sum.to_vec1::<f32>()?;
+        // 1. Temporarily dequantize ONLY this layer's 3D expert matrices
+        // Weights are unpacked into standard float Tensors on the GPU instantly
+        // Native shapes out of dequantize(): [2048, 1536, 64], [2048, 1536, 64], [1536, 2048, 64]
+        let w_gate = self.expert_gate_raw.dequantize(input.device())?;
+        let w_up = self.expert_up_raw.dequantize(input.device())?;
+        let w_down = self.expert_down_raw.dequantize(input.device())?;
 
-        for (expert_idx, &hit_count) in expert_indices.iter().enumerate() {
-            if hit_count <= 0.0 || expert_idx >= self.n_experts {
-                continue;
-            }
+        // 2. Permute the weights so the Expert ID (64) is at Axis 0
+        // Shape transformation: [Out, In, 64] -> [64, Out, In]
+        // This is required to perform batch matrix multiplications across experts
+        let w_gate = w_gate.permute((2, 0, 1))?; // Shape: [64, 2048, 1536]
+        let w_up = w_up.permute((2, 0, 1))?;     // Shape: [64, 2048, 1536]
+        let w_down = w_down.permute((2, 0, 1))?; // Shape: [64, 1536, 2048]
 
-            // 3. Find tokens for this expert
-            let current_expert_mask = expert_mask.narrow(2, expert_idx, 1)?.squeeze(2)?;
-            let flat_indices = nonzero_1d(&current_expert_mask)?;
+        // 3. Prepare the Input Activations track
+        // Repeat input top_k times to align with expert targets
+        let dispatch_tokens = input
+            .unsqueeze(1)?
+            .repeat(vec![1, top_k, 1])?
+            .flatten(0, 1)?; // Shape: [tokens * top_k, hidden_dim]
 
-            if flat_indices.dims1()? == 0 {
-                continue;
-            }
+        let dispatch_expert_ids = topk_indices.flatten_all()?.contiguous()?; // Shape: [tokens * top_k]
 
-            // 4. Expert Computation
-            let current_state = input.index_select(&flat_indices, 0)?;
-            
-            // Gate & Up projection - extract expert weights [hidden, 2*intermediate]
-            let gate_up_w = self.expert_gate_up.narrow(2, expert_idx, 1)?.squeeze(2)?; 
-            let gate_up = current_state.matmul(&gate_up_w.t()?)?;
+        // 4. Gather the specific weight slices for our active tokens
+        // Instead of computing all 64 experts, we use index_select to extract 
+        // ONLY the matrices for the experts chosen by the router
+        let active_w_gate = w_gate.index_select(&dispatch_expert_ids, 0)?; // [tokens * top_k, 2048, 1536]
+        let active_w_up = w_up.index_select(&dispatch_expert_ids, 0)?;     // [tokens * top_k, 2048, 1536]
+        let active_w_down = w_down.index_select(&dispatch_expert_ids, 0)?; // [tokens * top_k, 1536, 2048]
 
-            let [gate, up] = gate_up.chunk(2, candle_core::D::Minus1)?.try_into().unwrap();
-            let current_hidden = (silu(&gate)? * up)?;
+        // 5. Execute Fused Batched Multiplications
+        // input: [N, 1, hidden_dim] x weight.transpose(): [N, hidden_dim, intermediate]
+        let x_batched = dispatch_tokens.unsqueeze(1)?; // [tokens * top_k, 1, hidden_dim]
 
-            // Down proj - extract expert weights [hidden, hidden]
-            let down_w = self.expert_down.narrow(2, expert_idx, 1)?.squeeze(2)?;
-            let current_hidden = current_hidden.matmul(&down_w.t()?)?;
-            
-            // 5. Weighting and Accumulation
-            let current_weights = topk_weights
-                .index_select(&flat_indices, 0)?
-                .reshape((flat_indices.dims1()?, 1))?;
-            let weighted_hidden = current_hidden.broadcast_mul(&current_weights)?;
-            
-            final_hidden_states = final_hidden_states.index_add(&flat_indices.into(), &weighted_hidden, 0)?;
-        }
+        let gate_out = x_batched.matmul(&active_w_gate.transpose(1, 2)?)?.squeeze(1)?; // [tokens * top_k, 2048]
+        let up_out = x_batched.matmul(&active_w_up.transpose(1, 2)?)?.squeeze(1)?;     // [tokens * top_k, 2048]
 
-        Ok(final_hidden_states)
+        // Apply SwiGLU Activation Function
+        let current_hidden = (candle_nn::ops::silu(&gate_out)? * up_out)?; // [tokens * top_k, 2048]
+
+        // Project Down
+        let down_out = current_hidden.unsqueeze(1)?.matmul(&active_w_down.transpose(1, 2)?)?.squeeze(1)?; // [tokens * top_k, hidden_dim]
+
+        // 6. Apply Routing Weights and Re-combine
+        let weights_flat = topk_weights.flatten_all()?.unsqueeze(1)?;
+        let weighted_hidden = down_out.broadcast_mul(&weights_flat)?;
+
+        // Reshape back to [tokens, top_k, hidden_dim] and sum the experts track
+        let combined_hidden = weighted_hidden
+            .reshape((tokens, top_k, hidden_dim))?
+            .sum(1)?; // Squeezes down to [tokens, hidden_dim]
+
+        Ok(combined_hidden)
 
     }
 }
@@ -474,7 +519,7 @@ impl Model for Deepseek2Model {
     {
         // 1. Token embeddings
         range_push!("Embed step");
-        let mut x = self.embed_layer.forward(input)?;
+        let mut x = self.embed_layer.forward(input)?.to_dtype(self.compute_dtype)?;
         range_pop!();
 
         // 2. Transformer layers
@@ -491,8 +536,9 @@ impl Model for Deepseek2Model {
         range_pop!();
 
         // 3. Final normalization and output projection
-        let x = self.embed_norm.forward(&x.to_dtype(DType::F32)?)?;
-        let logits = self.lm_head.forward(&x.to_dtype(self.compute_dtype)?)?;
+        let x_contiguous = x.to_dtype(DType::F32)?;
+        let x = self.embed_norm.forward(&x_contiguous)?;
+        let logits = qmatmul_forward(&self.lm_head, &x.to_dtype(self.compute_dtype)?)?;
 
         Ok(logits)
     }
@@ -506,28 +552,26 @@ impl Deepseek2Model {
         requested_max_seq_len: usize,
     ) -> anyhow::Result<Self> {
         let _range = range!("Deepseek2Model loading");
-
+        debug!("Deepseek2 model load started...");
         let device = var_builder.device();
         let hidden_size = config.hidden_size;
         let n_heads = config.n_heads;
+        let vocab_size = config.vocab_size;
         let rope_dim = config.n_rope_dims.unwrap_or(hidden_size / n_heads);
 
         // Use the smaller of requested and configured max sequence length
         let effective_max_seq_len = config.max_seq_len.min(requested_max_seq_len);
 
         // Load embeddings (shared between input and output if no separate output.weight)
-        let embed_tensor =
-            get_tensor("token_embd.weight", var_builder.clone(), compute_dtype)?;
-
         let lm_head_tensor = if var_builder.contains_key("output.weight") {
-            get_tensor("output.weight", var_builder.clone(), compute_dtype)?
+            var_builder.get_no_shape("output.weight")?
         } else {
-            embed_tensor.clone()
+            var_builder.get_no_shape("token_embd.weight")?
         };
 
-        let embed_layer = Embedding::new(embed_tensor, hidden_size);
-        let lm_head = Linear::new(lm_head_tensor, None);
-
+        let embed_layer = Embedding::new(vocab_size, hidden_size, var_builder.pp("token_embd"))?;
+        let lm_head = QMatMul::from_arc(lm_head_tensor)?;
+        debug!("Embedding loaded");
         // Load embedding normalization
         let embed_norm_prefix = find_norm_prefix(var_builder.clone());
         let embed_norm =
@@ -541,7 +585,7 @@ impl Deepseek2Model {
             true,
             device,
         )?);
-
+        debug!("Rope created");
         // Load all transformer layers in parallel
         let rope_clone = Arc::clone(&rope);
         let layers = (0..config.n_layers)
@@ -558,7 +602,7 @@ impl Deepseek2Model {
                 )
             })
             .collect::<anyhow::Result<Vec<Deepseek2Layer>>>()?;
-
+        debug!("Layers loaded");
         Ok(Self {
             embed_layer,
             layers,
@@ -636,32 +680,22 @@ impl Deepseek2Model {
         let n_kv_heads = config.n_kv_heads[block_index];
 
         Ok(Deepseek2Attn {
-            q_compression: Linear::new(
-                get_tensor("attn_q_a.weight", var_builder.clone(), compute_dtype)?, 
-                None
-            ),
+            q_compression: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_q_a.weight")?
+            )?,
             q_norm: RmsNorm::new(q_lora_rank, rms_epsilon, var_builder.pp("attn_q_a_norm"))?,
-            q_decompression: Linear::new(
-                get_tensor("attn_q_b.weight", var_builder.clone(), compute_dtype)?, 
-                None
-            ),
-            kv_compression: Linear::new(
-                get_tensor("attn_kv_a_mqa.weight", var_builder.clone(), compute_dtype)?, 
-                None
-            ),
-            kv_norm: RmsNorm::new(kv_lora_rank, rms_epsilon, var_builder.pp("attn_q_a_norm"))?,
-            k_decompression: Linear::new(
-                get_tensor("attn_k_b.weight", var_builder.clone(), compute_dtype)?, 
-                None
-            ),
-            v_decompression: Linear::new(
-                get_tensor("attn_v_b.weight", var_builder.clone(), compute_dtype)?, 
-                None
-            ),
-            o_proj: Linear::new(
-                get_tensor("attn_output.weight", var_builder.clone(), compute_dtype)?, 
-                None
-            ),
+            q_decompression: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_q_b.weight")?
+            )?,
+            kv_compression: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_kv_a_mqa.weight")?
+            )?,
+            kv_norm: RmsNorm::new(kv_lora_rank, rms_epsilon, var_builder.pp("attn_kv_a_norm"))?,
+            k_decompression_raw: var_builder.get_no_shape("attn_k_b.weight")?,
+            v_decompression_raw: var_builder.get_no_shape("attn_v_b.weight")?,
+            o_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("attn_output.weight")?
+            )?,
             rope,
             rope_dim,
             n_heads: config.n_heads,
@@ -693,18 +727,15 @@ impl Deepseek2Model {
 
     fn load_dense_mixer(var_builder: &VarBuilder, compute_dtype: DType) -> anyhow::Result<DenseMixer> {
         Ok(DenseMixer {
-            up_proj: Linear::new(
-                get_tensor("ffn_up.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            gate_proj: Linear::new(
-                get_tensor("ffn_gate.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
-            down_proj: Linear::new(
-                get_tensor("ffn_down.weight", var_builder.clone(), compute_dtype)?,
-                None,
-            ),
+            up_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_up.weight")?
+            )?,
+            gate_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_gate.weight")?
+            )?,
+            down_proj: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_down.weight")?
+            )?,
             compute_dtype,
         })
     }
@@ -723,32 +754,25 @@ impl Deepseek2Model {
             anyhow::anyhow!("Missing expert_weights_scale, which is required for DeepSeek2 model"))? as f64;
         
         Ok(MoeMixer {
-            gate_inp: Linear::new(
-                get_tensor("ffn_gate_inp.weight", var_builder.clone(), compute_dtype)?,
-                None, 
-            ),
+            gate_inp: QMatMul::from_arc(
+                var_builder.get_no_shape("ffn_gate_inp.weight")?
+            )?,
             e_score_correction: get_tensor("exp_probs_b.bias", var_builder.clone(), compute_dtype)?,
             shared_mlp: DenseMixer {
-                up_proj: Linear::new(
-                    get_tensor("ffn_up_shexp.weight", var_builder.clone(), compute_dtype)?,
-                    None,
-                ),
-                gate_proj: Linear::new(
-                    get_tensor("ffn_gate_shexp.weight", var_builder.clone(), compute_dtype)?,
-                    None,
-                ),
-                down_proj: Linear::new(
-                    get_tensor("ffn_down_shexp.weight", var_builder.clone(), compute_dtype)?,
-                    None,
-                ),
+                up_proj: QMatMul::from_arc(
+                    var_builder.get_no_shape("ffn_up_shexp.weight")?
+                )?,
+                gate_proj: QMatMul::from_arc(
+                    var_builder.get_no_shape("ffn_gate_shexp.weight")?
+                )?,
+                down_proj: QMatMul::from_arc(
+                    var_builder.get_no_shape("ffn_down_shexp.weight")?
+                )?,
                 compute_dtype,
             },
-            expert_gate_up: Tensor::cat(&[
-                get_tensor("ffn_gate_exps.weight", var_builder.clone(), compute_dtype)?,
-                get_tensor("ffn_up_exps.weight", var_builder.clone(), compute_dtype)?
-            ], 
-            candle_core::D::Minus2)?,  // Each is [hidden_size, intermediate, n_experts]; concat on dim 1 → [hidden_size, 2*intermediate, n_experts]
-            expert_down: get_tensor("ffn_down_exps.weight", var_builder.clone(), compute_dtype)?,
+            expert_up_raw: var_builder.get_no_shape("ffn_up_exps.weight")?,
+            expert_gate_raw: var_builder.get_no_shape("ffn_gate_exps.weight")?,
+            expert_down_raw: var_builder.get_no_shape("ffn_down_exps.weight")?,
             n_experts,
             n_expert_used,
             n_group,

@@ -1,6 +1,6 @@
-use candle_core::{Tensor, Device, DType};
+use candle_core::{Tensor, Device, DType, Module};
 use candle_transformers::quantized_var_builder::VarBuilder;
-use candle_core::quantized::GgmlDType;
+use candle_core::quantized::{GgmlDType, QMatMul};
 
 pub fn repeat_kv(x: Tensor, n_rep: usize) -> anyhow::Result<Tensor> {
     if n_rep == 1 {
@@ -15,6 +15,14 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> anyhow::Result<Tensor> {
 
         anyhow::Ok(y)
     }
+}
+
+pub fn qmatmul_forward(qmatmul: &QMatMul, xs: &Tensor) -> anyhow::Result<Tensor> {
+    Ok(match xs.dtype() {
+        DType::F16 => qmatmul.forward_via_f16(xs)?,
+        DType::F32 => qmatmul.forward(xs)?,
+        _ => anyhow::bail!("Unsupported dtype: {:?} for qmatmul forward operation", xs.dtype()),
+    })
 }
 
 /// Load a tensor from the GGUF model and convert to the target compute dtype.

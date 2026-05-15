@@ -138,11 +138,14 @@ impl InferenceEngine {
     fn init_model(&self) -> anyhow::Result<Box<dyn Model>> {
         let start_time = Instant::now();
         range_push!("VarBuilder Init");
+        debug!("Creating VarBuilder...");
         let file = std::fs::File::open(&self.config.file_path)?;
         let mmap = unsafe {
             MmapOptions::new().map(&file)?
         };
         let var_builder = VarBuilder::from_gguf_buffer(&mmap, &self.device)?;
+
+        debug!("VarBuilder created");
         range_pop!();
         let model = ModelBuilder::new(self.config.clone(), var_builder, self.compute_dtype, self.max_seq_len, self.conv_on_cpu).build()?;
         debug!("Model loaded in {:.3}s", start_time.elapsed().as_secs_f32());
