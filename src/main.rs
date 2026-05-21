@@ -6,10 +6,13 @@ mod model;
 mod tokenizer;
 mod inference;
 mod session;
+mod api;
 
+use tokio;
 use tracing_subscriber::EnvFilter;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -18,5 +21,5 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
         
-    cli::run()
+    cli::run().await
 }

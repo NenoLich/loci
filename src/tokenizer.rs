@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use crate::error::LociError;
 use crate::gguf::{GgufInfo, GgufKVMeta};
-use crate::session::ChatMessage;
+use crate::api::types::{ChatMessage, Tool};
 use crate::config::TokenizerConfig;
 
 use tokenizers::Encoding;
@@ -109,7 +109,7 @@ impl TokenizerService {
         }
     }
 
-    pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String, LociError> {
+    pub fn apply_chat_template(&self, messages: &[ChatMessage], tools: &[Tool]) -> Result<String, LociError> {
         let mut env = Environment::new();
         let name = "chat";
         env.add_template(name, &self.chat_template)
@@ -132,7 +132,7 @@ impl TokenizerService {
             eom_token => eom_token,
             keep_past_thinking => false,
             messages => messages,
-            tools => Vec::<String>::new(),
+            tools => tools,
             add_generation_prompt => true,
         }).map_err(|e| LociError::Tokenization { source: Box::new(e) })?;
 

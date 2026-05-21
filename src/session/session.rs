@@ -1,42 +1,6 @@
-use std::fmt::{self, Display, Formatter};
-
-use serde::Serialize;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-impl Display for Role {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Role::System => write!(f, "system"),
-            Role::User => write!(f, "user"),
-            Role::Assistant => write!(f, "assistant"),
-            Role::Tool => write!(f, "tool"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatMessage {
-    role: Role,
-    content: String,
-}
-
-impl ChatMessage {
-    pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-        }
-    }
-}
+use crate::api::types::{ChatMessage, Role};
 
 pub struct Session {
     pub id: Uuid,

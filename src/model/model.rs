@@ -2,7 +2,7 @@ use candle_core::{DType, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_transformers::quantized_var_builder::VarBuilder;
 
-use crate::config::{ModelArchitecture, ModelConfig};
+use crate::config::{ModelArchitecture, ModelConfig, InferenceConfig};
 use crate::model::{Lfm2Model, Deepseek2Model};
 
 pub trait Model {
@@ -30,13 +30,13 @@ pub struct ModelBuilder {
 }
 
 impl ModelBuilder {
-    pub fn new(config: ModelConfig, var_builder: VarBuilder, compute_dtype: DType, max_seq_len: usize, conv_on_cpu: bool) -> Self {
+    pub fn new(config: ModelConfig, var_builder: VarBuilder, inference_config: InferenceConfig) -> Self {
         Self {
             config,
             var_builder,
-            compute_dtype,
-            max_seq_len,
-            conv_on_cpu,
+            compute_dtype: inference_config.compute_dtype,
+            max_seq_len: inference_config.max_seq_len,
+            conv_on_cpu: inference_config.conv_on_cpu,
         }
     }
 
