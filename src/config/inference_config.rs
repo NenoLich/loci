@@ -29,7 +29,7 @@ impl InferenceConfigBuilder {
         Self {
             dtype: DType::F16,
             max_seq_len: 32_000,
-            conv_on_cpu: True,
+            conv_on_cpu: true,
         }
     }
 

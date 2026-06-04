@@ -3,6 +3,20 @@ use std::str::FromStr;
 
 use crate::gguf::{GgufInfo, GgufKVMeta, GgufValue};
 use crate::config::{ModelConfig, ModelArchitecture}; 
+use crate::inference::ToolFormatStyle;
+
+pub struct Lfm2ExtraParameters;
+
+impl Lfm2ExtraParameters {
+    pub const SUPPORTS_TOOL_CALLING: bool = true;
+    pub const SUPPORTS_REASONING: bool = false;
+    pub const TOOL_CALL_START_TOKEN_ID: Option<u32> = Some(10);
+    pub const TOOL_CALL_END_TOKEN_ID: Option<u32> = Some(11);
+    pub const FLATTEN_TOOLS_TO_FUNCTIONS: bool = true;
+    pub const REASONING_START_TOKEN_ID: Option<u32> = None;
+    pub const REASONING_END_TOKEN_ID: Option<u32> = None;
+    pub const TOOL_CALL_FORMAT_STYLE: ToolFormatStyle = ToolFormatStyle::PythonCall;
+}
 
 pub struct Lfm2Parser;
 
@@ -100,6 +114,18 @@ impl Lfm2Parser {
             expert_weights_scale: None,
             expert_weights_norm: None,
             n_rope_dims: None,
+            supports_reasoning: Lfm2ExtraParameters::SUPPORTS_REASONING,
+            reasoning_start_token_id: Lfm2ExtraParameters::REASONING_START_TOKEN_ID,
+            reasoning_end_token_id: Lfm2ExtraParameters::REASONING_END_TOKEN_ID,
+            supports_tool_calling: Lfm2ExtraParameters::SUPPORTS_TOOL_CALLING,
+            tool_call_start_token_id: Lfm2ExtraParameters::TOOL_CALL_START_TOKEN_ID,
+            tool_call_end_token_id: Lfm2ExtraParameters::TOOL_CALL_END_TOKEN_ID,
+            tool_call_format_style: Lfm2ExtraParameters::TOOL_CALL_FORMAT_STYLE,
+            flatten_tools_to_functions: Lfm2ExtraParameters::FLATTEN_TOOLS_TO_FUNCTIONS,
+            arg_key_open_token_id: None,
+            arg_key_close_token_id: None,
+            arg_value_open_token_id: None,
+            arg_value_close_token_id: None,
         })
     }
 

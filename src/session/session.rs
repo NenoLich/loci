@@ -8,7 +8,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(system_message: impl Into<String>) -> Self {
+    pub fn new(system_message: &str) -> Self {
         let id = Uuid::new_v4();
         Self {
             id,
@@ -20,19 +20,22 @@ impl Session {
         &self.messages
     }
 
-    pub fn add_message(&mut self, role: Role, content: impl Into<String>) {
-        self.messages.push(ChatMessage::new(role, content));
+    pub fn add_message(&mut self, chat_message: ChatMessage) {
+        self.messages.push(chat_message);
     }
 
-    pub fn add_user_message(&mut self, message: impl Into<String>) {
-        self.add_message(Role::User, message);
+    pub fn add_user_message(&mut self, message: &str) {
+        let chat_message = ChatMessage::new(Role::User, message);
+        self.add_message(chat_message);
     }
 
-    pub fn add_assistant_message(&mut self, message: impl Into<String>) {
-        self.add_message(Role::Assistant, message);
+    pub fn add_assistant_message(&mut self, message: &str) {
+        let chat_message = ChatMessage::new(Role::Assistant, message);
+        self.add_message(chat_message);
     }
 
-    pub fn add_tool_message(&mut self, message: impl Into<String>) {
-        self.add_message(Role::Tool, message);
+    pub fn add_tool_message(&mut self, message: &str) {
+        let chat_message = ChatMessage::new(Role::Tool, message);
+        self.add_message(chat_message);
     }
 }

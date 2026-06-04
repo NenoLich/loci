@@ -2,11 +2,12 @@ use candle_core::{Result, Tensor};
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use std::collections::HashMap;
 use crate::config::GenerationConfig;
+use crate::api::types::{ToolChoiceMode, ToolChoice};
 
 #[derive(Debug, Clone)]
 pub struct SamplingResult {
-    token: u32,
-    logprob: f32,
+    pub token: u32,
+    pub logprob: Option<f32>,
     pub top_k_logprobs: Option<Vec<TopKEntry>>,
 }
 
@@ -19,6 +20,8 @@ pub struct InferenceSampler {
     temperature: f32,
     top_p: f32,
     repetition_penalty: f32,
+    is_tool_call_forbidden: bool,
+    tool_start_token_id: Option<usize>,
     rng: rand::rngs::StdRng,
     logits_buffer: Vec<f32>,
     sort_buffer: Vec<(usize, f32)>,
@@ -28,12 +31,14 @@ pub struct InferenceSampler {
 
 impl InferenceSampler {
     /// Configures a new standalone logic processor
-    pub fn new(config: GenerationConfig, vocab_size: usize, penalty_window: usize) -> Self {
+    pub fn new(config: GenerationConfig, vocab_size: usize, penalty_window: usize, tool_start_token_id: Option<u32>) -> Self {
         use rand::SeedableRng;
         Self {
             temperature: config.temperature.max(0.0),
             top_p: config.top_p.clamp(0.0, 1.0),
             repetition_penalty: config.repetition_penalty.max(1.0),
+            is_tool_call_forbidden: config.tool_choice == ToolChoice::Mode(ToolChoiceMode::None) && tool_start_token_id.is_some(),
+            tool_start_token_id: tool_start_token_id.and_then(|v| Some(v as usize)),
             rng: rand::rngs::StdRng::seed_from_u64(config.seed as u64),
             // Pre-allocate the full vocabulary size upfront
             logits_buffer: vec![0.0; vocab_size],
@@ -52,22 +57,28 @@ impl InferenceSampler {
     }
 
     /// Primary entry point: transforms raw logits and samples a single token ID
-    pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+    pub fn sample(&mut self, logits: &Tensor) -> anyhow::Result<u32> {
         // 1. Ensure logits are flattened to a 1D vector representing the final prediction step
-        let logits_tensor = if logits.rank() >= 2 {
-            logits.flatten_all()?
-        } else {
+        let logits_tensor = if logits.rank() == 1 {
             logits.clone()
+        } else {
+            logits.flatten_all()?  
         };
 
-        let cpu_logits = logits_tensor.to_device(&candle_core::Device::Cpu)?;
-        let (storage, _layout) = cpu_logits.storage_and_layout();
+        let cpu_logits = logits_tensor
+            .to_dtype(candle_core::DType::F32)?
+            .to_device(&candle_core::Device::Cpu)?;
+
+        let (storage, layout) = cpu_logits.storage_and_layout();
         
         if let candle_core::Storage::Cpu(cpu_storage) = &*storage {
-            let raw_slice: &[f32] = cpu_storage.as_slice()?;
+            let entire_raw_slice: &[f32] = cpu_storage.as_slice()?;
+            let start_offset = layout.start_offset();
+            let end_offset = start_offset + cpu_logits.shape().elem_count();
+            let raw_slice = &entire_raw_slice[start_offset..end_offset];
             self.logits_buffer[..raw_slice.len()].copy_from_slice(raw_slice);
         } else {
-            return Err(candle_core::Error::msg("Failed to resolve CPU storage mapping"));
+            anyhow::bail!("Failed to resolve CPU storage mapping");
         }
         let vocab_len = self.logits_buffer.len();
 
@@ -82,6 +93,15 @@ impl InferenceSampler {
                     } else {
                         self.logits_buffer[idx] = val * self.repetition_penalty;
                     }
+                }
+            }
+        }
+
+        // Ban Tool Call
+        if self.is_tool_call_forbidden {
+            if let Some(tool_start_token_id) = self.tool_start_token_id {
+                if tool_start_token_id < vocab_len {
+                    self.logits_buffer[tool_start_token_id] = f32::NEG_INFINITY;
                 }
             }
         }
@@ -148,8 +168,7 @@ impl InferenceSampler {
         }
 
         // 7. Weighted Random Distribution Selection
-        let dist = WeightedIndex::new(&self.logits_buffer)
-            .map_err(|e| candle_core::Error::wrap(e))?;
+        let dist = WeightedIndex::new(&self.logits_buffer)?;
         
         let sampled_token = dist.sample(&mut self.rng) as u32;
         self.add_token(sampled_token);
@@ -157,23 +176,29 @@ impl InferenceSampler {
         Ok(sampled_token)
     }
 
-    pub fn sample_with_logprobs(&mut self, logits: &Tensor, top_k_logprobs: usize) -> Result<SamplingResult> {
+    pub fn sample_with_logprobs(&mut self, logits: &Tensor, top_k_logprobs: usize) -> anyhow::Result<SamplingResult> {
         let top_k = top_k_logprobs.clamp(0, 5);
         // 1. Ensure logits are flattened to a 1D vector representing the final prediction step
-        let logits_tensor = if logits.rank() >= 2 {
-            logits.flatten_all()?
-        } else {
+        let logits_tensor = if logits.rank() == 1 {
             logits.clone()
+        } else {
+            logits.flatten_all()?  
         };
 
-        let cpu_logits = logits_tensor.to_device(&candle_core::Device::Cpu)?;
-        let (storage, _layout) = cpu_logits.storage_and_layout();
+        let cpu_logits = logits_tensor
+            .to_dtype(candle_core::DType::F32)?
+            .to_device(&candle_core::Device::Cpu)?;
+
+        let (storage, layout) = cpu_logits.storage_and_layout();
         
         if let candle_core::Storage::Cpu(cpu_storage) = &*storage {
-            let raw_slice: &[f32] = cpu_storage.as_slice()?;
+            let entire_raw_slice: &[f32] = cpu_storage.as_slice()?;
+            let start_offset = layout.start_offset();
+            let end_offset = start_offset + cpu_logits.shape().elem_count();
+            let raw_slice = &entire_raw_slice[start_offset..end_offset];
             self.logits_buffer[..raw_slice.len()].copy_from_slice(raw_slice);
         } else {
-            return Err(candle_core::Error::msg("Failed to resolve CPU storage mapping"));
+            anyhow::bail!("Failed to resolve CPU storage mapping");
         }
         let vocab_len = self.logits_buffer.len();
 
@@ -192,6 +217,15 @@ impl InferenceSampler {
             }
         }
 
+        // Ban Tool Call
+        if self.is_tool_call_forbidden {
+            if let Some(tool_start_token_id) = self.tool_start_token_id {
+                if tool_start_token_id < vocab_len {
+                    self.logits_buffer[tool_start_token_id] = f32::NEG_INFINITY;
+                }
+            }
+        }
+
         // 3. Handle Greedy Sampling (If Temp is 0, pick highest score directly)
         if self.temperature == 0.0 {
             let sampled = self.logits_buffer.iter()
@@ -203,7 +237,7 @@ impl InferenceSampler {
 
             return Ok(SamplingResult {
                 token: sampled,
-                logprob: 0.0,
+                logprob: None,
                 top_k_logprobs: None,
             });
         }
@@ -260,8 +294,7 @@ impl InferenceSampler {
         }
 
         // 7. Weighted Random Distribution Selection
-        let dist = WeightedIndex::new(&self.logits_buffer)
-            .map_err(|e| candle_core::Error::wrap(e))?;
+        let dist = WeightedIndex::new(&self.logits_buffer)?;
         let sampled_token = dist.sample(&mut self.rng) as u32;
         
         self.add_token(sampled_token);
@@ -277,7 +310,7 @@ impl InferenceSampler {
             .unwrap_or(1e-45);
 
         let mut entries = Vec::with_capacity(top_k);
-        for i in 0..actual_k {
+        for i in 0..top_k {
             let (token_idx, prob) = self.sort_buffer[i];
             let safe_prob = if prob > 0.0 { prob } else { 1e-45 };
             entries.push(TopKEntry {
@@ -288,7 +321,7 @@ impl InferenceSampler {
 
         Ok(SamplingResult {
             token: sampled_token,
-            logprob: chosen_true_prob.ln(),
+            logprob: Some(chosen_true_prob.ln()),
             top_k_logprobs: Some(entries),
         })
 

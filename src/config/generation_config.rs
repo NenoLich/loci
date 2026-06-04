@@ -1,4 +1,5 @@
 use crate::gguf::GgufInfo;
+use crate::api::types::{ToolChoice, ToolChoiceMode, ReasoningEffort};
 
 /// Generation parameters with priority: CLI > GGUF metadata > defaults
 #[derive(Debug, Clone)]
@@ -7,6 +8,11 @@ pub struct GenerationConfig {
     pub temperature: f32,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    pub tool_choice: ToolChoice,
+    pub reasoning_effort: ReasoningEffort,
+    pub stop_tokens: Option<Vec<String>>,
+    pub logprobs: bool,
+    pub top_logprobs: Option<usize>,
     pub seed: usize,
 }
 
@@ -22,6 +28,12 @@ impl GenerationConfig {
         let mut max_tokens = GenerationConfigDefaults::MAX_TOKENS;
         let mut top_p = GenerationConfigDefaults::TOP_P;
         let mut repetition_penalty = GenerationConfigDefaults::REPETITION_PENALTY;
+        let mut tool_choice = GenerationConfigDefaults::TOOL_CHOICE;
+        let mut reasoning_effort = GenerationConfigDefaults::REASONING_EFFORT;
+        let mut stop_tokens = GenerationConfigDefaults::STOP_TOKENS;
+        let mut logprobs = GenerationConfigDefaults::LOGPROBS;
+        let mut top_logprobs = GenerationConfigDefaults::TOP_LOGPROBS;
+        let mut seed = GenerationConfigDefaults::SEED;
 
         let metadata = &gguf_info.kv_meta;
 
@@ -62,18 +74,28 @@ impl GenerationConfig {
             temperature,
             top_p,
             repetition_penalty,
-            seed: GenerationConfigDefaults::SEED,
+            tool_choice,
+            reasoning_effort,
+            stop_tokens,
+            logprobs,
+            top_logprobs,
+            seed,
         })
     }
 }
 
 /// Builder for GenerationConfig with priority resolution
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GenerationConfigBuilder {
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<usize>,
     repetition_penalty: Option<f32>,
+    tool_choice: Option<ToolChoice>,
+    reasoning_effort: Option<ReasoningEffort>,
+    stop_tokens: Option<Vec<String>>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<usize>,
     seed: Option<usize>,
     gguf_config: Option<GenerationConfig>,
 }
@@ -100,6 +122,36 @@ impl GenerationConfigBuilder {
     /// Set explicit repetition_penalty (CLI argument)
     pub fn repetition_penalty(mut self, penalty: Option<f32>) -> Self {
         self.repetition_penalty = penalty;
+        self
+    }
+
+    /// Set explicit tool_choice (CLI argument)
+    pub fn tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
+        self.tool_choice = tool_choice;
+        self
+    }
+
+    /// Set explicit reasoning_effort (CLI argument)
+    pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Set explicit stop_tokens (CLI argument)
+    pub fn stop_tokens(mut self, stop_tokens: Option<Vec<String>>) -> Self {
+        self.stop_tokens = stop_tokens;
+        self
+    }
+
+    /// Set explicit logprobs (CLI argument)
+    pub fn logprobs(mut self, logprobs: Option<bool>) -> Self {
+        self.logprobs = logprobs;
+        self
+    }
+
+    /// Set explicit top_logprobs (CLI argument)
+    pub fn top_logprobs(mut self, top_logprobs: Option<usize>) -> Self {
+        self.top_logprobs = top_logprobs;
         self
     }
 
@@ -136,6 +188,31 @@ impl GenerationConfigBuilder {
         } else {
             self.repetition_penalty
         };
+        self.tool_choice = if let Some(tool_choice) = overrides.tool_choice {
+            Some(tool_choice)
+        } else {
+            self.tool_choice
+        };
+        self.reasoning_effort = if let Some(effort) = overrides.reasoning_effort {
+            Some(effort)
+        } else {
+            self.reasoning_effort
+        };
+        self.stop_tokens = if let Some(stop_tokens) = overrides.stop_tokens {
+            Some(stop_tokens)
+        } else {
+            self.stop_tokens
+        };
+        self.logprobs = if let Some(logprobs) = overrides.logprobs {
+            Some(logprobs)
+        } else {
+            self.logprobs
+        };
+        self.top_logprobs = if let Some(top_logprobs) = overrides.top_logprobs {
+            Some(top_logprobs)
+        } else {
+            self.top_logprobs
+        };
         self.seed = if let Some(seed) = overrides.seed {
             Some(seed)
         } else {
@@ -163,6 +240,24 @@ impl GenerationConfigBuilder {
                 .repetition_penalty
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.repetition_penalty))
                 .unwrap_or(GenerationConfigDefaults::REPETITION_PENALTY),
+            tool_choice: self
+                .tool_choice
+                .or_else(|| self.gguf_config.as_ref().map(|c| c.tool_choice.clone()))
+                .unwrap_or(GenerationConfigDefaults::TOOL_CHOICE),
+            reasoning_effort: self
+                .reasoning_effort
+                .or_else(|| self.gguf_config.as_ref().map(|c| c.reasoning_effort.clone()))
+                .unwrap_or(GenerationConfigDefaults::REASONING_EFFORT),
+            stop_tokens: self
+                .stop_tokens
+                .or_else(|| self.gguf_config.as_ref().and_then(|c| c.stop_tokens.clone())),
+            logprobs: self
+                .logprobs
+                .or_else(|| self.gguf_config.as_ref().map(|c| c.logprobs))
+                .unwrap_or(GenerationConfigDefaults::LOGPROBS),
+            top_logprobs: self
+                .top_logprobs
+                .or_else(|| self.gguf_config.as_ref().and_then(|c| c.top_logprobs)),
             seed: self
                 .seed
                 .unwrap_or(GenerationConfigDefaults::SEED),
@@ -178,6 +273,11 @@ impl GenerationConfigDefaults {
     pub const MAX_TOKENS: usize = 32_000;
     pub const TOP_P: f32 = 0.9;
     pub const REPETITION_PENALTY: f32 = 1.15;
+    pub const TOOL_CHOICE: ToolChoice = ToolChoice::Mode(ToolChoiceMode::Auto);
+    pub const REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+    pub const STOP_TOKENS: Option<Vec<String>> = None;
+    pub const LOGPROBS: bool = false;
+    pub const TOP_LOGPROBS: Option<usize> = None;
     pub const SEED: usize = 19;
 }
 
@@ -187,6 +287,11 @@ pub struct GenerationOverrides {
     pub top_p: Option<f32>,
     pub max_tokens: Option<usize>,
     pub repetition_penalty: Option<f32>,
+    pub tool_choice: Option<ToolChoice>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub stop_tokens: Option<Vec<String>>,
+    pub logprobs: Option<bool>,
+    pub top_logprobs: Option<usize>,
     pub seed: Option<usize>,
 }
 
@@ -196,6 +301,11 @@ impl GenerationOverrides {
         top_p: Option<f32>,
         max_tokens: Option<usize>,
         repetition_penalty: Option<f32>,
+        tool_choice: Option<ToolChoice>,
+        reasoning_effort: Option<ReasoningEffort>,
+        stop_tokens: Option<Vec<String>>,
+        logprobs: Option<bool>,
+        top_logprobs: Option<usize>,
         seed: Option<usize>,
     ) -> Self {
         Self {
@@ -203,6 +313,11 @@ impl GenerationOverrides {
             top_p,
             max_tokens,
             repetition_penalty,
+            tool_choice,
+            reasoning_effort,
+            stop_tokens,
+            logprobs,
+            top_logprobs,
             seed,
         }
     }
@@ -224,6 +339,31 @@ impl GenerationOverrides {
 
     pub fn repetition_penalty(mut self, penalty: f32) -> Self {
         self.repetition_penalty = Some(penalty);
+        self
+    }
+
+    pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    pub fn reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(reasoning_effort);
+        self
+    }
+
+    pub fn stop_tokens(mut self, stop_tokens: Vec<String>) -> Self {
+        self.stop_tokens = Some(stop_tokens);
+        self
+    }
+
+    pub fn logprobs(mut self, logprobs: bool) -> Self {
+        self.logprobs = Some(logprobs);
+        self
+    }
+
+    pub fn top_logprobs(mut self, top_logprobs: usize) -> Self {
+        self.top_logprobs = Some(top_logprobs);
         self
     }
 

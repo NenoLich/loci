@@ -3,6 +3,23 @@ use std::str::FromStr;
 
 use crate::gguf::{GgufInfo, GgufKVMeta, GgufValue};
 use crate::config::{ModelConfig, ModelArchitecture}; 
+use crate::inference::ToolFormatStyle;
+
+pub struct DeepSeek2ExtraParameters;
+
+impl DeepSeek2ExtraParameters {
+    pub const SUPPORTS_TOOL_CALLING: bool = true;
+    pub const SUPPORTS_REASONING: bool = true;
+    pub const TOOL_CALL_START_TOKEN_ID: Option<u32> = Some(151352);
+    pub const TOOL_CALL_END_TOKEN_ID: Option<u32> = Some(151353);
+    pub const REASONING_START_TOKEN_ID: Option<u32> = Some(151350);
+    pub const REASONING_END_TOKEN_ID: Option<u32> = Some(151351);
+    pub const TOOL_CALL_FORMAT_STYLE: ToolFormatStyle = ToolFormatStyle::XmlArgPairs;
+    pub const ARG_KEY_OPEN_TOKEN_ID: Option<u32> = Some(151356);
+    pub const ARG_KEY_CLOSE_TOKEN_ID: Option<u32> = Some(151357);
+    pub const ARG_VALUE_OPEN_TOKEN_ID: Option<u32> = Some(151358);
+    pub const ARG_VALUE_CLOSE_TOKEN_ID: Option<u32> = Some(151359);
+}
 
 pub struct Deepseek2Parser;
 
@@ -129,6 +146,18 @@ impl Deepseek2Parser {
             expert_weights_scale,
             expert_weights_norm,
             n_rope_dims,
+            supports_reasoning: DeepSeek2ExtraParameters::SUPPORTS_REASONING,
+            supports_tool_calling: DeepSeek2ExtraParameters::SUPPORTS_TOOL_CALLING,
+            tool_call_start_token_id: DeepSeek2ExtraParameters::TOOL_CALL_START_TOKEN_ID,
+            tool_call_end_token_id: DeepSeek2ExtraParameters::TOOL_CALL_END_TOKEN_ID,
+            reasoning_start_token_id: DeepSeek2ExtraParameters::REASONING_START_TOKEN_ID,
+            reasoning_end_token_id: DeepSeek2ExtraParameters::REASONING_END_TOKEN_ID,
+            tool_call_format_style: DeepSeek2ExtraParameters::TOOL_CALL_FORMAT_STYLE,
+            flatten_tools_to_functions: false,
+            arg_key_open_token_id: DeepSeek2ExtraParameters::ARG_KEY_OPEN_TOKEN_ID,
+            arg_key_close_token_id: DeepSeek2ExtraParameters::ARG_KEY_CLOSE_TOKEN_ID,
+            arg_value_open_token_id: DeepSeek2ExtraParameters::ARG_VALUE_OPEN_TOKEN_ID,
+            arg_value_close_token_id: DeepSeek2ExtraParameters::ARG_VALUE_CLOSE_TOKEN_ID,
         })
     }
 

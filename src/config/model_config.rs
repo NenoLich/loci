@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use crate::gguf::GgufInfo;
 use crate::config::{Lfm2Parser, Deepseek2Parser};
+use crate::inference::ToolFormatStyle;
 
 #[derive(Debug, Clone)]
 pub enum ModelArchitecture {
@@ -63,6 +64,18 @@ pub struct ModelConfig {
     pub expert_weights_scale: Option<f32>,
     pub expert_weights_norm: Option<bool>,
     pub n_rope_dims: Option<usize>,
+    pub supports_tool_calling: bool,
+    pub supports_reasoning: bool,
+    pub tool_call_start_token_id: Option<u32>,
+    pub tool_call_end_token_id: Option<u32>,
+    pub flatten_tools_to_functions: bool,
+    pub reasoning_start_token_id: Option<u32>,
+    pub reasoning_end_token_id: Option<u32>,
+    pub tool_call_format_style: ToolFormatStyle,
+    pub arg_key_open_token_id: Option<u32>,
+    pub arg_key_close_token_id: Option<u32>,
+    pub arg_value_open_token_id: Option<u32>,
+    pub arg_value_close_token_id: Option<u32>,
 }
 
 impl ModelConfig {

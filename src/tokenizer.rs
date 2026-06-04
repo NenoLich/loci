@@ -1,12 +1,13 @@
 use ahash::AHashMap;
-use candle_core::cuda::cudarc::types;
+
 use tokenizers::pre_tokenizers::sequence::Sequence;
-use std::io::Write;
-use std::collections::BTreeSet;
+use std::io::{Write, ErrorKind, Error};
+use std::collections::{BTreeSet};
+use regex::Regex;
 
 use crate::error::LociError;
 use crate::gguf::{GgufInfo, GgufKVMeta};
-use crate::api::types::{ChatMessage, Tool};
+use crate::api::types::*;
 use crate::config::TokenizerConfig;
 
 use tokenizers::Encoding;
@@ -17,6 +18,7 @@ use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::{AddedToken, Tokenizer};
 use once_cell::sync::OnceCell;
 use minijinja::{Environment, context};
+use tracing::debug;
 
 use tempfile::NamedTempFile;
 
@@ -32,18 +34,25 @@ impl TokenizerDefaults {
     pub const EOM_TOKEN_ID: u32 = 2;
 }
 
-#[derive(Default)]
-pub struct StreamState {
-    pub tokens: Vec<u32>,
-    pub prev_index: usize,
-    pub read_index: usize,
+/// Minimal streaming context for incremental token-to-text decoding.
+/// Accumulates tokens until a complete UTF-8 sequence is decodable, then clears.
+#[derive(Debug)]
+pub struct StreamContext {
+    pending_tokens: Vec<u32>,
 }
 
-impl StreamState {
-    pub fn clear(&mut self) {
-        self.tokens.clear();
-        self.prev_index = 0;
-        self.read_index = 0;
+impl StreamContext {
+    /// Create a new streaming context with pre-allocated capacity.
+    /// Typical token buffering is 1-3 tokens before UTF-8 boundary, so capacity of 8 is safe.
+    pub fn with_capacity(capacity: usize) -> Self {
+        StreamContext {
+            pending_tokens: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Reset the streaming context by clearing all pending tokens.
+    pub fn reset(&mut self) {
+        self.pending_tokens.clear();
     }
 }
 
@@ -82,34 +91,62 @@ impl TokenizerService {
         self.eos_token_id
     }
 
-    pub fn process_token(&self, state: &mut StreamState, token: u32) -> Result<Option<String>, LociError> {
-        let prev_text = self.decode(&state.tokens[state.prev_index..state.read_index], true)?;
-        
-        state.tokens.push(token);
-        let text = self.decode(&state.tokens[state.prev_index..], true)?;
+    /// Process a single token and accumulate it in the stream context.
+    /// Returns decoded text once a complete UTF-8 boundary is reached.
+    /// Caller owns the StreamContext - no allocation overhead.
+    pub fn process_token_stream(
+        &self,
+        ctx: &mut StreamContext,
+        token: u32,
+    ) -> Result<Option<String>, LociError> {
+        ctx.pending_tokens.push(token);
+        let text = self.decode(&ctx.pending_tokens, true)?;
 
-        if text.len() > prev_text.len() && !text.ends_with('\u{FFFD}') {
-            let text = text.split_at(prev_text.len()).1.to_string();
-            state.prev_index = state.read_index;
-            state.read_index = state.tokens.len();
+        // Check if we have a complete decodable string (no incomplete UTF-8 replacement char)
+        if !text.ends_with('\u{FFFD}') {
+            ctx.pending_tokens.clear();
             Ok(Some(text))
         } else {
             Ok(None)
         }
     }
 
-    pub fn decode_rest(&self, state: &mut StreamState) -> Result<Option<String>, LociError> {
-        let prev_text = self.decode(&state.tokens[state.prev_index..state.read_index], true)?;
-        let text = self.decode(&state.tokens[state.prev_index..], true)?;
-        if text.len() > prev_text.len() {
-            let text = text.split_at(prev_text.len()).1.to_string();
+    /// Process multiple tokens and accumulate them in the stream context.
+    /// Returns decoded text once a complete UTF-8 boundary is reached.
+    pub fn process_multiple_token_stream(
+        &self,
+        ctx: &mut StreamContext,
+        tokens: &[u32],
+    ) -> Result<Option<String>, LociError> {
+        ctx.pending_tokens.extend_from_slice(tokens);
+        let text = self.decode(&ctx.pending_tokens, true)?;
+
+        if !text.ends_with('\u{FFFD}') {
+            ctx.pending_tokens.clear();
             Ok(Some(text))
         } else {
             Ok(None)
         }
     }
 
-    pub fn apply_chat_template(&self, messages: &[ChatMessage], tools: &[Tool]) -> Result<String, LociError> {
+    /// Finalize the stream and retrieve any remaining decoded text.
+    /// Clears the context after retrieval.
+    pub fn finalize_stream(&self, ctx: &mut StreamContext) -> Result<Option<String>, LociError> {
+        if ctx.pending_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        let text = self.decode(&ctx.pending_tokens, true)?;
+        ctx.pending_tokens.clear();
+
+        if !text.is_empty() && !text.ends_with('\u{FFFD}') {
+            Ok(Some(text))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn apply_chat_template(&self, messages: &[ChatMessage], raw_tools: &[Tool], enable_thinking: bool, flatten_tools_to_functions: bool) -> Result<String, LociError> {
         let mut env = Environment::new();
         let name = "chat";
         env.add_template(name, &self.chat_template)
@@ -124,20 +161,98 @@ impl TokenizerService {
             self.eot_token.get_or_try_init(|| self.decode(&[self.eot_token_id], false))?;
         let eom_token = 
             self.eom_token.get_or_try_init(|| self.decode(&[self.eom_token_id], false))?;
+        
+        // Build tools as list of JSON strings with proper field ordering
+        let tools_json_list = build_tools_json_list(raw_tools, flatten_tools_to_functions)?;
 
         let rendered = template.render(context! {
             bos_token => bos_token,
             eos_token => eos_token,
             eot_token => eot_token,
             eom_token => eom_token,
-            keep_past_thinking => false,
+            clear_thinking => false,
             messages => messages,
-            tools => tools,
             add_generation_prompt => true,
+            enable_thinking => enable_thinking,
+            tools => tools_json_list,
         }).map_err(|e| LociError::Tokenization { source: Box::new(e) })?;
 
         Ok(rendered)
     }
+}
+
+/// Build tools as list of JSON strings with proper field ordering
+fn build_tools_json_list(raw_tools: &[Tool], flatten: bool) -> Result<Vec<String>, LociError> {
+    raw_tools
+        .iter()
+        .map(|tool| {
+            let tool_value = if flatten {
+                serde_json::json!({
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "parameters": tool.function.parameters,
+                })
+            } else {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.function.name,
+                        "description": tool.function.description,
+                        "parameters": tool.function.parameters,
+                    }
+                })
+            };
+            serialize_json_with_order(&tool_value)
+        })
+        .collect()
+}
+
+/// Serialize JSON value with fields ordered: name → description → parameters (at all levels)
+fn serialize_json_with_order(value: &serde_json::Value) -> Result<String, LociError> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut fields = Vec::new();
+            
+            // Priority order for top-level fields
+            let priority_keys = ["type", "name", "description", "function", "parameters", "properties", "required"];
+            for key in &priority_keys {
+                if let Some(val) = map.get(*key) {
+                    fields.push((key.to_string(), serialize_json_with_order(val)?));
+                }
+            }
+            
+            // Add remaining keys in iteration order
+            for (key, val) in map {
+                if !priority_keys.contains(&key.as_str()) {
+                    fields.push((key.clone(), serialize_json_with_order(val)?));
+                }
+            }
+            
+            let json_fields = fields
+                .into_iter()
+                .map(|(k, v)| format!("\"{}\": {}", escape_json_string(&k), v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!("{{{}}}", json_fields))
+        }
+        serde_json::Value::Array(arr) => {
+            let items = arr
+                .iter()
+                .map(|v| serialize_json_with_order(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", items.join(",")))
+        }
+        serde_json::Value::String(s) => Ok(format!("\"{}\"", escape_json_string(s))),
+        other => Ok(other.to_string()),
+    }
+}
+
+fn escape_json_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 pub struct TokenizerServiceBuilder {
@@ -181,7 +296,8 @@ impl TokenizerServiceBuilder {
             });
         }
 
-        if let Some(ref ct) = config.chat_template { self.chat_template = ct.into(); }
+        let cleaned_template = Self::clean_chat_template(config.chat_template.as_deref());
+        if let Some(ct) = cleaned_template { self.chat_template = ct; }
         if let Some(id) = config.bos_token_id { self.bos_token_id = id; }
         if let Some(id) = config.eos_token_id { self.eos_token_id = id; }
         if let Some(id) = config.eot_token_id { self.eot_token_id = id; }
@@ -411,5 +527,96 @@ impl TokenizerServiceBuilder {
 
         tokenizer.with_post_processor(processor.ok());
         Ok(())
+    }
+
+    fn clean_chat_template(template: Option<&str>) -> Option<String> {
+        if template.is_none() {
+            return None;
+        }
+        let template = template.unwrap(); 
+        let mut env = Environment::new();
+        let name = "chat_check";
+
+        // Step 1: Always try to compile and immediately test-render it
+        if env.add_template(name, template).is_ok() {
+            if let Ok(tmpl) = env.get_template(name) {
+                // We must mock a render to see if it actually executes without errors
+                let mock_messages = [
+                    ChatMessage {
+                        role: Role::System,
+                        content: Some("You are a helpful assistant".to_string()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: Some("Hello".to_string()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ];
+                let mock_tools = [
+                    Tool {
+                        r#type: "Tool 1".to_string(),
+                        function: Function {
+                            name: "tool_1".to_string(),
+                            description: Some("This is tool 1".to_string()),
+                            parameters: FunctionParameters {
+                                r#type: "object".to_string(),
+                                properties: None,
+                                required: vec![],
+                            }
+                        },
+                    },
+                    Tool {
+                        r#type: "Tool 2".to_string(),
+                        function: Function {
+                            name: "tool_2".to_string(),
+                            description: Some("This is tool 2".to_string()),
+                            parameters: FunctionParameters {
+                                r#type: "object".to_string(),
+                                properties: None,
+                                required: vec![],
+                            }
+                        },
+                    },
+                ];
+                let test_render = tmpl.render(context! {
+                    messages => mock_messages,
+                    tools => mock_tools,
+                });
+
+                match test_render {
+                    Ok(_) => return Some(template.to_string()),
+                    Err(err) => {
+                        // Step 2: Dispatch on the error. 
+                        // MiniJinja throws a TemplateNotFound or UnknownMethodErrorKind dynamically.
+                        let err_msg = err.to_string();
+                        if err_msg.contains("no method named get") || err.kind() == minijinja::ErrorKind::UnknownMethod {
+                            return Self::fix_python_code(template);
+                        } else {
+                            debug!("Template validation failed with error: {}", err_msg);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn fix_python_code(template: &str) -> Option<String> {
+        // Matches .get('key') or .get("key") including variations in spacing
+        let pattern = match Regex::new("\\.get\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)") {
+            Ok(reg) => reg,
+            Err(_) => return Some(template.to_string()),
+        };
+        
+        // Converts .get('tool_calls') into ['tool_calls']
+        let fixed = pattern.replace_all(template, "[$1$2$1]").into_owned();
+        Some(fixed)
     }
 }

@@ -1,8 +1,9 @@
-use crate::inference::{InferenceEngine, StreamCallback};
+use crate::inference::{InferenceEngine, StreamCallback, StreamFrame, GenerationDataType};
 use crate::gguf::Loader;
 use crate::tokenizer::{TokenizerServiceBuilder, TokenizerService};
 use crate::session::SessionManager;
 use crate::config::{GenerationOverrides, InferenceConfig};
+use crate::api::run_server;
 use crate::api::worker::EngineWorker;
 use candle_core::DType;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -154,26 +155,31 @@ pub async fn run() -> anyhow::Result<()> {
             use_flash,
             stream,
         } => {
-            let inference_engine = init_inference_engine(model_path, compute_dtype, max_seq_len)?;
+            let start = std::time::Instant::now();
+            let inferece_config = build_inference_config(compute_dtype, max_seq_len, true);
+            let inference_engine = init_inference_engine(
+                model_path, 
+                &inferece_config,
+            )?;
+            let model_loading_time = start.elapsed().as_secs_f64();
 
             let gen_overrides = GenerationOverrides::new(
                 temperature,
                 top_p,
                 max_tokens,
                 repetition_penalty,
+                None,
+                None,
+                None,
+                None,
+                None,
                 seed,
             );
 
             println!("🦀 Generating: \"{}\"", prompt);
-            let start = std::time::Instant::now();
-
+            
             let stream_callback: StreamCallback = if stream {
-                Box::new(|output_chunk| {
-                        print!("{}", output_chunk.green());
-                        use std::io::Write;
-                        std::io::stdout().flush()?;
-                        anyhow::Ok(())
-                    })
+                Box::new(stdout_callback)
             } else {
                 Box::new(|_| { anyhow::Ok(()) })
             };
@@ -185,15 +191,15 @@ pub async fn run() -> anyhow::Result<()> {
             )?;
 
             if !stream {
-                println!("\n✨ Output:\n{}", report.text);
+                println!("\n✨ Output:\n{:?}", report.chat_message);
             }
 
-            let elapsed = start.elapsed();
+            println!("\n⏱️  Model loading time: {:.2}s", model_loading_time);
             println!(
-                "\n⏱️  Generated {} tokens in {:.2}s ({:.2} tok/s)",
-                report.num_tokens,
-                elapsed.as_secs_f64(),
-                report.num_tokens as f64 / report.token_generation_sec,
+                "⏱️  Generated {} tokens in {:.2}s ({:.2} tok/s)",
+                report.usage.completion_tokens,
+                report.token_generation_sec,
+                report.usage.completion_tokens as f64 / report.token_generation_sec,
             );
         },
         Commands::Chat { 
@@ -208,27 +214,34 @@ pub async fn run() -> anyhow::Result<()> {
             compute_dtype, 
             max_seq_len, 
             use_flash, 
-            stream } => {
-            let inference_engine = init_inference_engine(model_path, compute_dtype, max_seq_len)?;
-
+            stream 
+        } => {
+            let start = std::time::Instant::now();
+            let inferece_config = build_inference_config(compute_dtype, max_seq_len, true);
+            let inference_engine = init_inference_engine(
+                model_path, 
+                &inferece_config,
+            )?;
+            let model_loading_time = start.elapsed().as_secs_f64();
+            
             let gen_overrides = GenerationOverrides::new(
                 temperature,
                 top_p,
                 max_tokens,
                 repetition_penalty,
+                None,
+                None,
+                None,
+                None,
+                None,
                 seed,
             );
 
             println!("🦀 Generating: \"{}\"", prompt);
-            let start = std::time::Instant::now();
+            
 
             let stream_callback: StreamCallback = if stream {
-                Box::new(|output_chunk| {
-                        print!("{}", output_chunk.green());
-                        use std::io::Write;
-                        std::io::stdout().flush()?;
-                        anyhow::Ok(())
-                    })
+                Box::new(stdout_callback)
             } else {
                 Box::new(|_| { anyhow::Ok(()) })
             };
@@ -246,65 +259,96 @@ pub async fn run() -> anyhow::Result<()> {
                 stream_callback,
             )?;
 
-            let assistant_message = &report.text;
-            session.add_assistant_message(assistant_message);
+            session.add_message(report.chat_message);
             let chat_messages = session.get_messages();
 
             println!("\n✨ Chat history:\n{:?}", chat_messages);
 
-            let elapsed = start.elapsed();
+            println!("\n⏱️  Model loading time: {:.2}s", model_loading_time);
             println!(
-                "\n⏱️  Generated {} tokens in {:.2}s ({:.2} tok/s)",
-                report.num_tokens,
-                elapsed.as_secs_f64(),
-                report.num_tokens as f64 / report.token_generation_sec,
+                "⏱️  Generated {} tokens in {:.2}s ({:.2} tok/s)",
+                report.usage.completion_tokens,
+                report.token_generation_sec,
+                report.usage.completion_tokens as f64 / report.token_generation_sec,
             );
         },
-        Commands::Serve { bind, idle_timeout, model_path, compute_dtype, max_seq_len } => {
-            let inference_config = InferenceConfig::builder()
-                .dtype(dtype)
-                .max_seq_len(max_seq_len)
-                .conv_on_cpu(true)
-                .build();
+        Commands::Serve { 
+            bind, 
+            idle_timeout, 
+            model_path, 
+            compute_dtype, 
+            max_seq_len 
+        } => {
+            let inference_config = build_inference_config(compute_dtype, max_seq_len, true);
 
-            let engine_opt = model_path
-                .and_then(|path| {
-                    let path_str = model_path.to_string_lossy();
-                    let path_sanitized = path_str.replace('\\', "/");
-                    let engine = InferenceEngine::builder()
-                        .with_gguf_metadata(&path_sanitized)
-                        .config(inference_config)
-                        .build()?;
-                    Some(engine)
-                });
+            let engine_opt = if let Some(model_path_str) = model_path {
+                Some(init_inference_engine(model_path_str, &inference_config)?)
+            } else {
+                None
+            };
 
             let (command_tx, command_rx) = tokio::sync::mpsc::channel(100);
             let worker = EngineWorker::new(inference_config, engine_opt, command_rx, idle_timeout);
             tokio::spawn(worker.run());
             
-            api::run_server(command_tx, &bind).await?;
+            run_server(command_tx, &bind).await?;
         },
     }
 
     anyhow::Ok(())
 }
 
-pub fn init_inference_engine(model_path: OsString, compute_dtype: ComputeDtype, max_seq_len: usize) -> anyhow::Result<InferenceEngine> {
-    let path_str = model_path.to_string_lossy();
-    let path_sanitized = path_str.replace('\\', "/");
+pub fn build_inference_config(compute_dtype: ComputeDtype, max_seq_len: usize, conv_on_cpu: bool) -> InferenceConfig {
     let dtype = match compute_dtype {
         ComputeDtype::F16 => DType::F16,
         ComputeDtype::F32 => DType::F32,
     };
 
-    let inference_config = InferenceConfig::builder()
+    InferenceConfig::builder()
         .dtype(dtype)
         .max_seq_len(max_seq_len)
-        .conv_on_cpu(true)
-        .build();
+        .conv_on_cpu(conv_on_cpu)
+        .build()
+}
+
+pub fn init_inference_engine(model_path: OsString, config: &InferenceConfig) -> anyhow::Result<InferenceEngine> {
+    let path_str = model_path.to_string_lossy();
+    let path_sanitized = path_str.replace('\\', "/");
 
     Ok(InferenceEngine::builder()
         .with_gguf_metadata(&path_sanitized)
-        .config(inference_config)
+        .config(config)
         .build()?)
+}
+
+pub fn stdout_callback(stream_frame: StreamFrame) -> anyhow::Result<()> {
+    let output_chunk = match stream_frame.output_type {
+        GenerationDataType::DirectContent => stream_frame.output.green(),
+        GenerationDataType::ToolCallName => {
+            if let Some(tool_call_chunk) = stream_frame.tool_call_chunk {
+                if let Some(name) = tool_call_chunk.function.name {
+                    print!("\n Tool Call:\n");
+                    format!("{}: ", name).blue().bold()
+                }
+                else {
+                    "".normal()
+                }
+            } else {
+                "".normal()
+            }
+        },
+        GenerationDataType::ToolCallArguments => {
+            if let Some(tool_call_chunk) = stream_frame.tool_call_chunk {
+                tool_call_chunk.function.arguments.bright_cyan()
+            } else {
+                "".normal()
+            }
+        },
+        GenerationDataType::Reasoning => stream_frame.output.bright_black().italic(),
+    };
+
+    print!("{}", output_chunk);
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    anyhow::Ok(())
 }

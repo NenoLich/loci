@@ -11,7 +11,7 @@ impl SessionManager {
         Self { sessions: vec![] }
     }
 
-    pub fn start_session(&mut self, system_prompt: impl Into<String>) -> &mut Session {
+    pub fn start_session(&mut self, system_prompt: &str) -> &mut Session {
         let session = Session::new(system_prompt);
         self.sessions.push(session);
         self.sessions.last_mut().unwrap()

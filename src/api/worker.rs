@@ -1,15 +1,20 @@
 use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
+use tokio::sync::mpsc::error::TrySendError::{Closed, Full};
 use axum::response::sse::Event;
 use axum::http::StatusCode;
 use serde_json::json;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::{info, error};
+use uuid::Uuid;
 
-use crate::inference::{InferenceEngine, StreamCallback};
+use crate::inference::{InferenceEngine, StreamCallback, StreamFrame, GenerationDataType, GenerationReport};
+use crate::error::LociError;
+use crate::gguf::GgufInfo;
+use crate::config::InferenceConfig;
 use crate::config::GenerationOverrides;
 use crate::api::types::*;
 
@@ -65,7 +70,7 @@ impl EngineWorker {
                                 // Load new model (automatically drops old one)
                                 match InferenceEngine::builder()
                                     .with_gguf_metadata(req.model.clone())
-                                    .config(self.config)
+                                    .config(&self.config)
                                     .build() 
                                 {
                                     Ok(eng) => {
@@ -78,23 +83,23 @@ impl EngineWorker {
                                 }
                             }
 
-                            // 2. We have the engine! Setup your channel streaming
-                            let engine = self.active_engine.unwrap().clone();
+                            let engine = self.active_engine.clone().unwrap();
                             let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
 
                             // Send the receiving end back to the Axum handler immediately
                             let _ = response_tx.send(Ok(stream_rx));
 
-                            // 3. Process the inference synchronously inside this worker thread.
-                            // This naturally forces requests into a single-file line!
-                            if req.stream.unwrap_or(false) {
-                                // For streaming, we run your generator loop until it finishes
-                                // filling the `tx` channel.
-                                run_stream_generation(engine, req, stream_tx).await;
-                            } else {
-                                // For non-streaming, run generation and send a single event
-                                run_single_generation(engine, req, stream_tx).await;
-                            }
+                            // 3. Process the inference synchronously inside this blocking thread.
+                            tokio::task::spawn_blocking(move || {
+                                if req.stream.unwrap_or(false) {
+                                    run_stream_generation(engine, req, stream_tx);
+                                } else {
+                                    // For non-streaming, run generation and send a single event
+                                    run_single_generation(engine, req, stream_tx);
+                                }
+
+                            
+                            });
 
                             // Update tracking timestamp
                             last_used = Instant::now();
@@ -114,7 +119,7 @@ impl EngineWorker {
     }
 }
 
-async fn run_stream_generation(
+fn run_stream_generation(
     engine: Arc<InferenceEngine>,
     req: ValidatedChatCompletionRequest,
     stream_tx: Sender<Result<Event, Infallible>>,
@@ -124,6 +129,11 @@ async fn run_stream_generation(
         req.top_p,
         req.max_tokens,
         req.repetition_penalty,
+        Some(req.tool_choice),
+        req.reasoning_effort,
+        req.stop,
+        req.logprobs,
+        req.top_logprobs,
         req.seed,
     );
 
@@ -138,30 +148,67 @@ async fn run_stream_generation(
         system_fingerprint: format!("loci-{}", req.model),
     };
 
-    let initial_chunk = build_initial_chunk(&static_data);
+    let initial_chunk = build_initial_chunk(static_data.clone());
     if let Ok(event) = Event::default().json_data(initial_chunk) {
-        let _ = stream_tx.send(Ok(event)).await;
+        if stream_tx.try_send(Ok(event)).is_err() {
+            // The client disconnected (closed browser tab)
+            info!("User disconnected. Stopping generation.");
+            return;
+        }
     };
     
     let callback_tx = stream_tx.clone();
     let callback_static_data = static_data.clone();
     let callback: StreamCallback = 
-        Box::new(move |chunk| {
-            let event = Event::default()
-            if callback_tx.blocking_send(Ok(event)).is_err() {
-                anyhow::bail!("User disconnected");
-            };
+        Box::new(move |frame_data| {
+            let regular_chunk = build_regular_chunk(callback_static_data.clone(), frame_data);
+            let event = Event::default().json_data(regular_chunk)?;
+            match callback_tx.try_send(Ok(event)) {
+                Err(Full(message)) => {
+                    std::thread::sleep(std::time::Duration::from_micros(10));
+                    // Try one more time after the sleep
+                    if callback_tx.try_send(message).is_err() {
+                        anyhow::bail!("Stream channel backed up or closed");
+                    };
+                }
+                Err(Closed(_)) => {
+                    // The client disconnected (closed browser tab)
+                    info!("User disconnected. Stopping generation.");
+                    anyhow::bail!("User disconnected");
+                }
+                _ => (),
+            }
+
+            Ok(())
         });
-    match engine.generate_chat_stream(&req.messages, &req.tools, overrides, true, callback) {
+    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, true, callback) {
         Ok(report) => {
-            
+            let final_content_chunk = build_final_content_chunk(static_data.clone(), report.finish_reason.clone());
+            if let Ok(final_chunk_event) = Event::default().json_data(final_content_chunk) {
+                if stream_tx.try_send(Ok(final_chunk_event)).is_err() {
+                    // The client disconnected (closed browser tab)
+                    info!("User disconnected. Stopping generation.");
+                    return;
+                }
+            }
+            if matches!(req.stream_options, Some(options) if options.include_usage == Some(true)) {
+                let usage_chunk = build_usage_chunk(static_data.clone(), report);
+                if let Ok(usage_chunk_event) = Event::default().json_data(usage_chunk) {
+                    if stream_tx.try_send(Ok(usage_chunk_event)).is_err() {
+                        // The client disconnected (closed browser tab)
+                        info!("User disconnected. Stopping generation.");
+                        return;
+                    }
+                }
+            }
+
         },
         Err(e) => {
             if e.to_string().contains("User disconnected") {
                 info!("Generation stopped early: client closed the connection.");
             } else {
                 let error_msg = format!("Generation failed with an engine error: {}", e);
-                error!(&error_msg);
+                error!("{}", &error_msg);
                 let json_error = json!({
                     "error": {
                         "message": error_msg,
@@ -170,7 +217,11 @@ async fn run_stream_generation(
                     }
                 });
                 if let Ok(event) = Event::default().json_data(json_error) {
-                    let _ = stream_tx.send(Ok(event)).await;
+                    if stream_tx.try_send(Ok(event)).is_err() {
+                        // The client disconnected (closed browser tab)
+                        info!("User disconnected. Stopping generation.");
+                        return;
+                    }
                 };
             }
         }
@@ -178,7 +229,7 @@ async fn run_stream_generation(
 }
 
 fn build_initial_chunk(
-    static_data: &StaticChatCompletionData,
+    static_data: StaticChatCompletionData,
 ) -> ChatCompletionChunk {
     let choices = vec![
         ChunkChoice {
@@ -204,24 +255,59 @@ fn build_initial_chunk(
     }
 }
 
-fn build_content_chunk(
-    static_data: &StaticChatCompletionData,
+fn build_regular_chunk<'a>(
+    static_data: StaticChatCompletionData,
+    frame_data: StreamFrame<'a>,
 ) -> ChatCompletionChunk {
+    let role = None;
+    let delta = match frame_data.output_type {
+        GenerationDataType::DirectContent => ChunkDelta {
+            role,
+            content: Some(frame_data.output.to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+        },
+        GenerationDataType::ToolCallName | GenerationDataType::ToolCallArguments => ChunkDelta {
+            role,
+            content: None,
+            reasoning_content: None,
+            tool_calls: frame_data.tool_call_chunk
+                            .map(|tc| vec![tc])
+        },
+        GenerationDataType::Reasoning => ChunkDelta {
+            role,
+            content: None,
+            reasoning_content: Some(frame_data.output.to_string()),
+            tool_calls: None,
+        },
+    };
+
     ChatCompletionChunk {
         id: static_data.id,
         object: "chat.completion.chunk".to_string(),
         created: static_data.created,
         model: static_data.model,
         system_fingerprint: static_data.system_fingerprint,
-        choices: vec![],
+        choices: vec![
+            ChunkChoice {
+                index: 0,
+                delta,
+                logprobs: frame_data.logprobs
+                    .map(|cl| ChunkLogprob {
+                        content:vec![cl]
+                    }),
+                finish_reason: None,
+            }
+        ],
         usage: None,
     }
 }
 
 fn build_final_content_chunk(
-    static_data: &StaticChatCompletionData,
+    static_data: StaticChatCompletionData,
+    finish_reason: FinishReason,
 ) -> ChatCompletionChunk {
-    let choices = ChunkChoice {
+    let choice = ChunkChoice {
         index: 0,
         delta: ChunkDelta {
             role: None,
@@ -230,8 +316,8 @@ fn build_final_content_chunk(
             reasoning_content: None,
         },
         logprobs: None,
-        finish_reason: None,
-    }
+        finish_reason: Some(finish_reason),
+    };
 
     ChatCompletionChunk {
         id: static_data.id,
@@ -239,13 +325,14 @@ fn build_final_content_chunk(
         created: static_data.created,
         model: static_data.model,
         system_fingerprint: static_data.system_fingerprint,
-        choices: vec![],
+        choices: vec![choice],
         usage: None,
     }
 }
 
 fn build_usage_chunk(
-    static_data: &StaticChatCompletionData,
+    static_data: StaticChatCompletionData,
+    report: GenerationReport,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: static_data.id,
@@ -254,93 +341,80 @@ fn build_usage_chunk(
         model: static_data.model,
         system_fingerprint: static_data.system_fingerprint,
         choices: vec![],
-        usage: None,
+        usage: Some(report.usage),
     }
 }
 
-async fn generate_chat_completion(
+fn run_single_generation(
     engine: Arc<InferenceEngine>,
     req: ValidatedChatCompletionRequest,
-) -> anyhow::Result<GenerationReport> {
-    let prompt = build_prompt_from_messages(&req.messages);
-    let temperature = req.temperature.unwrap_or(0.7) as f64;
-    let max_tokens = req.max_tokens.unwrap_or(256);
-    
-    // Call your existing inference engine
-    state.engine.generate_chat_stream(
-        &prompt,
-        max_tokens,
-        temperature,
-        false,  // use_flash
-        |_| Ok(()),  // no-op callback for non-streaming
-    )
-}
+    stream_tx: Sender<Result<Event, Infallible>>,
+) -> () {
+    let overrides = GenerationOverrides::new(
+        req.temperature,
+        req.top_p,
+        req.max_tokens,
+        req.repetition_penalty,
+        Some(req.tool_choice),
+        req.reasoning_effort,
+        req.stop,
+        req.logprobs,
+        req.top_logprobs,
+        req.seed,
+    );
 
-fn stream_chat_completion(
-    engine: Arc<InferenceEngine>,
-    req: ValidatedChatCompletionRequest,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
-    
-    // Spawn generation in background
-    tokio::spawn(async move {
-        let prompt = build_prompt_from_messages(&req.messages);
-        let temperature = req.temperature.unwrap_or(0.7) as f64;
-        let max_tokens = req.max_tokens.unwrap_or(256);
-        let model_name = req.model.unwrap_or_else(|| "loci-local".to_string());
-        let id = Uuid::new_v4().to_string();
-        let created = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        // Callback: send each token chunk via SSE
-        let callback = move |chunk: &str| {
-            let event = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model_name.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: ChunkDelta {
-                        role: None,
-                        content: Some(chunk.to_string()),
-                    },
-                    finish_reason: None,
-                }],
+    let callback: StreamCallback = Box::new(|_| Ok(()));
+    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, true, callback) {
+        Ok(report) => {
+            let chat_completion_response = build_chat_completion_response(&req.model, report);
+            if let Ok(response_event) = Event::default().json_data(chat_completion_response) {
+                match stream_tx.try_send(Ok(response_event)) {
+                    Err(Full(event)) => {
+                        std::thread::sleep(std::time::Duration::from_micros(10));
+                        // Try one more time after the sleep
+                        if stream_tx.try_send(event).is_err() {
+                            info!("Stream channel backed up or closed");
+                        };
+                    }
+                    Err(Closed(_)) => {
+                        // The client disconnected (closed browser tab)
+                        info!("User disconnected. Stopping generation.");
+                        return;;
+                    }
+                    _ => (),
+                };
+            }
+        },
+        Err(e) => {
+            let error_msg = format!("Generation failed with an engine error: {}", e);
+            error!("{}", &error_msg);
+            let json_error = json!({
+                "error": {
+                    "message": error_msg,
+                    "type": "engine_error",
+                    "code": 500
+                }
+            });
+            if let Ok(event) = Event::default().json_data(json_error) {
+                if stream_tx.try_send(Ok(event)).is_err() {
+                    // The client disconnected (closed browser tab)
+                    info!("User disconnected. Stopping generation.");
+                    return;
+                };
             };
-            let sse_event = Event::default().json_data(event).unwrap();
-            tx.blocking_send(Ok(sse_event))
-                .map_err(|_| anyhow::anyhow!("Channel closed"))
-        };
-        
-        // Generate!
-        let _ = state.engine.generate_chat_stream(
-            &prompt,
-            max_tokens,
-            temperature,
-            false,
-            callback,
-        );
-        
-        // Send final [DONE] event
-        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-    });
-    
-    Sse::new(ReceiverStream::new(rx))
+        }
+    }
 }
 
-fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
-    // Simple concatenation; for production, use your chat template!
-    messages
-        .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn build_completion_response(report: GenerationReport) -> ChatCompletionResponse {
+fn build_chat_completion_response(
+    model: &str,
+    report: GenerationReport,
+) -> ChatCompletionResponse {
+        let choices = vec![Choice {
+            index: 0,
+            message: report.chat_message,
+            finish_reason: Some(report.finish_reason),
+        }];
     ChatCompletionResponse {
         id: Uuid::new_v4().to_string(),
         object: "chat.completion".to_string(),
@@ -348,19 +422,9 @@ fn build_completion_response(report: GenerationReport) -> ChatCompletionResponse
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        model: "loci-local".to_string(),
-        choices: vec![Choice {
-            index: 0,
-            message: ChatMessage {
-                role: "assistant".to_string(),
-                content: report.text,
-            },
-            finish_reason: Some("stop".to_string()),
-        }],
-        usage: Some(Usage {
-            prompt_tokens: 0,  // TODO: track from tokenizer
-            completion_tokens: report.num_tokens,
-            total_tokens: report.num_tokens,
-        }),
+        model: model.to_string(),
+        system_fingerprint: format!("loci-{}", model),
+        choices,
+        usage: Some(report.usage),
     }
 }

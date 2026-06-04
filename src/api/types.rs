@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::Value;
-use axum::response::Response;
+use serde_json::{Value, json};
+use axum::extract::{FromRequest, Request};
+use axum::response::{Response, IntoResponse};
 use axum::http::StatusCode;
 use axum::Json;
 
@@ -29,7 +30,7 @@ pub struct ChatCompletionRequest {
     pub seed: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -55,32 +56,46 @@ pub struct ChatMessage {
     #[serde(serialize_with = "serialize_option_string")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ResponseToolCall>>,
+    pub reasoning_content: Option<String>, 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
-    pub fn new(role: Role, content: impl Into<String>) -> Self {
+    pub fn new(role: Role, content: &str) -> Self {
         Self {
             role,
-            content: Some(content.into()),
+            content: Some(content.to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
     }
 
-    pub fn with_tool_calls(role: Role, tool_calls: &[ResponseToolCall]) -> Self {
+    pub fn with_reasoning_content(role: Role, content: &str, reasoning_content: &str) -> Self {
+        Self {
+            role,
+            content: Some(content.to_string()),
+            reasoning_content: Some(reasoning_content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn with_tool_calls(role: Role, tool_calls: Vec<ToolCall>, reasoning_content: Option<&str>) -> Self {
         Self {
             role,
             content: None,
-            tool_calls: Some(tool_calls.to_vec()),
+            reasoning_content: reasoning_content.map(|s| s.to_string()),
+            tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
@@ -146,7 +161,7 @@ pub struct FunctionParameters {
     pub required: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ToolChoice {
     // Handles string flags: "none", "auto", "required"
@@ -156,7 +171,7 @@ pub enum ToolChoice {
     Specific(SpecificToolChoice),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoiceMode {
     None,
@@ -164,28 +179,28 @@ pub enum ToolChoiceMode {
     Required,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct SpecificToolChoice {
     pub r#type: String, // Always "function"
     pub function: SpecificFunctionChoice,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct SpecificFunctionChoice {
     pub name: String, // The name of the specific function to force
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseToolCall {
+pub struct ToolCall {
     pub id: String,
     pub r#type: String,
-    pub function: ResponseFunctionCall,
+    pub function: FunctionDefinition,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseFunctionCall {
+pub struct FunctionDefinition {
     pub name: String,
-    pub arguments: String,
+    pub arguments: HashMap<String, Value>, 
 }
 
 #[derive(Debug, Serialize)]
@@ -203,21 +218,21 @@ pub struct ChatCompletionResponse {
 pub struct Choice {
     pub index: usize,
     pub message: ChatMessage,
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<FinishReason>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct Usage {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: u32,
@@ -225,7 +240,7 @@ pub struct PromptTokensDetails {
     pub audio_tokens: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct CompletionTokensDetails {
     #[serde(default)]
     pub reasoning_tokens: u32,
@@ -277,7 +292,7 @@ pub struct ChunkDelta {
     pub tool_calls: Option<Vec<ChunkToolCall>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ChunkToolCall {
     // The index of the tool call in the array
     pub index: u32,
@@ -290,7 +305,7 @@ pub struct ChunkToolCall {
     pub function: ChunkFunctionCall,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ChunkFunctionCall {
     // Only present on the first chunk initiating the function call
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,34 +315,35 @@ pub struct ChunkFunctionCall {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChunkLogprobs {
+pub struct ChunkLogprob {
     pub content: Vec<LogprobsContent>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct LogprobsContent {
     pub token: String,
-    pub logprob: f64,
+    pub logprob: f32,
     pub bytes: Vec<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_logprobs: Option<TopLogprobs>,
+    pub top_logprobs: Option<Vec<TopLogprobs>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TopLogprobs {
     pub token: String,
-    pub logprob: f64,
+    pub logprob: f32,
     pub bytes: Vec<u8>,
 }
+
 pub struct ValidatedChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Tool>>,
-    pub tool_choice: Option<ToolChoice>,
+    pub tool_choice: ToolChoice,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<usize>,
-    pub repetion_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub stream: Option<bool>,
     pub stream_options: Option<StreamOptions>,
@@ -353,7 +369,7 @@ where
             .map_err(|e| {
                 let error = json!({
                     "error": {
-                        "message": format!("Invalid JSON: {}", err),
+                        "message": format!("Invalid JSON: {}", e),
                         "type": "invalid_request_error"
                     }
                 });
@@ -370,21 +386,49 @@ where
             return Err((StatusCode::BAD_REQUEST, Json(error)).into_response());
         };
 
-        let messages = payload.messages;
-        if messages.is_empty() && messages.iter().any(|message| 
-            message.role == Role::User && message.content.is_some_and(|content| !content.is_empty())) {
-                let error = json!({
-                    "error": {
-                        "message": "messages must contain at least one user message",
-                        "type": "invalid_request_error"
-                    }
-                });
-                return Err((StatusCode::BAD_REQUEST, Json(error)).into_response());
+        let model = model_name.replace('\\', "/");
+
+        let mut messages = payload.messages;
+        let mut has_user_message = false;
+        let mut has_system_message = false;
+
+        if !messages.is_empty() {
+            for message in &messages {
+                if message.role == Role::User && message.content.as_ref().is_some_and(|content| !content.is_empty()) {
+                    has_user_message = true;
+                } else if message.role == Role::System && message.content.as_ref().is_some_and(|content| !content.is_empty()) {
+                    has_system_message = true;
+                }
+            }
         }
+
+        if !has_user_message {
+            let error = json!({
+                "error": {
+                    "message": "messages must contain at least one user message",
+                    "type": "invalid_request_error"
+                }
+            });
+            return Err((StatusCode::BAD_REQUEST, Json(error)).into_response());
+        }
+
+        if !has_system_message {
+            messages.insert(
+                0, 
+                ChatMessage::new(Role::System, "You are a helpfull assistant")
+            );
+        }
+
+        let tool_choice = if let Some(tool_choice) = payload.tool_choice {
+            tool_choice
+        } else if payload.tools.is_some() && !payload.tools.as_ref().unwrap().is_empty() {
+            ToolChoice::Mode(ToolChoiceMode::Auto)
+        } else {
+            ToolChoice::Mode(ToolChoiceMode::None)
+        };
 
         let ChatCompletionRequest {
             tools,
-            tool_choice,
             temperature,
             top_p,
             max_tokens,
@@ -399,8 +443,8 @@ where
             ..
         } = payload;
 
-        Ok(ValidatedChatRequest {
-            model: model_name.replace('\\', "/"),
+        Ok(ValidatedChatCompletionRequest {
+            model,
             messages,
             tools,
             tool_choice,

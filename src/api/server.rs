@@ -13,7 +13,7 @@ use crate::inference::InferenceEngine;
 use std::time::Instant;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use crate::api::handlers::{chat_completions, AppState, ActiveInferenceSlot};
+use crate::api::handlers::{chat_completions, AppState};
 use crate::api::worker::WorkerCommand;
 
 pub fn create_router(command_tx: Sender<WorkerCommand>) -> Router {

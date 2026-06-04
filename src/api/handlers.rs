@@ -8,7 +8,7 @@ use futures::stream::Stream;
 use serde_json::json;
 use std::{convert::Infallible, time::{UNIX_EPOCH, Instant}, sync::Arc};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::oneshot;
 
 
 use crate::{
@@ -27,7 +27,7 @@ pub struct AppState {
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ValidatedChatCompletionRequest>,
+    req: ValidatedChatCompletionRequest,
 ) -> Response {
     let (response_tx, response_rx) = oneshot::channel();
 
