@@ -38,6 +38,9 @@ pub enum LociError {
     #[error("Invalid file format: {0}")]
     InvalidFileFormat(String),
 
+    #[error("Configuration error: {0}")]
+    Config(String),
+
     #[error("Invalid {file_type} metadata for field '{field}' at offset {offset}")]
     InvalidFileMetadata {
         file_type: String,

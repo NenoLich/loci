@@ -1,5 +1,6 @@
 use crate::gguf::GgufInfo;
 use crate::api::types::{ToolChoice, ToolChoiceMode, ReasoningEffort};
+use crate::config::GenerationFileConfig;
 
 /// Generation parameters with priority: CLI > GGUF metadata > defaults
 #[derive(Debug, Clone)]
@@ -98,6 +99,7 @@ pub struct GenerationConfigBuilder {
     top_logprobs: Option<usize>,
     seed: Option<usize>,
     gguf_config: Option<GenerationConfig>,
+    file_config: Option<GenerationFileConfig>,
 }
 
 impl GenerationConfigBuilder {
@@ -218,6 +220,16 @@ impl GenerationConfigBuilder {
         } else {
             self.seed
         };
+        self.file_config = if let Some(file_config) = overrides.file_config {
+            Some(file_config)
+        } else {
+            self.file_config
+        };
+        self
+    }
+
+    pub fn with_file_config(mut self, config: Option<GenerationFileConfig>) -> Self {
+        self.file_config = config;
         self
     }
 
@@ -226,40 +238,50 @@ impl GenerationConfigBuilder {
         GenerationConfig {
             temperature: self
                 .temperature
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.temperature))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.temperature))
                 .unwrap_or(GenerationConfigDefaults::TEMPERATURE),
             top_p: self
                 .top_p
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.top_p))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.top_p))
                 .unwrap_or(GenerationConfigDefaults::TOP_P),
             max_tokens: self
                 .max_tokens
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.max_tokens))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.max_tokens))
                 .unwrap_or(GenerationConfigDefaults::MAX_TOKENS),
             repetition_penalty: self
                 .repetition_penalty
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.repetition_penalty))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.repetition_penalty))
                 .unwrap_or(GenerationConfigDefaults::REPETITION_PENALTY),
             tool_choice: self
                 .tool_choice
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.tool_choice.clone()))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.tool_choice.clone()))
                 .unwrap_or(GenerationConfigDefaults::TOOL_CHOICE),
             reasoning_effort: self
                 .reasoning_effort
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.reasoning_effort.clone()))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.reasoning_effort.clone()))
                 .unwrap_or(GenerationConfigDefaults::REASONING_EFFORT),
             stop_tokens: self
                 .stop_tokens
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.stop_tokens.clone()))
                 .or_else(|| self.gguf_config.as_ref().and_then(|c| c.stop_tokens.clone())),
             logprobs: self
                 .logprobs
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.logprobs))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.logprobs))
                 .unwrap_or(GenerationConfigDefaults::LOGPROBS),
             top_logprobs: self
                 .top_logprobs
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.top_logprobs))
                 .or_else(|| self.gguf_config.as_ref().and_then(|c| c.top_logprobs)),
             seed: self
                 .seed
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.seed))
                 .unwrap_or(GenerationConfigDefaults::SEED),
         }
     }
@@ -293,6 +315,7 @@ pub struct GenerationOverrides {
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<usize>,
     pub seed: Option<usize>,
+    pub file_config: Option<GenerationFileConfig>,
 }
 
 impl GenerationOverrides {
@@ -307,6 +330,7 @@ impl GenerationOverrides {
         logprobs: Option<bool>,
         top_logprobs: Option<usize>,
         seed: Option<usize>,
+        file_config: Option<GenerationFileConfig>,
     ) -> Self {
         Self {
             temperature,
@@ -319,6 +343,7 @@ impl GenerationOverrides {
             logprobs,
             top_logprobs,
             seed,
+            file_config,
         }
     }
 
@@ -369,6 +394,11 @@ impl GenerationOverrides {
 
     pub fn seed(mut self, seed: usize) -> Self {
         self.seed = Some(seed);
+        self
+    }
+
+    pub fn file_config(mut self, file_config: GenerationFileConfig) -> Self {
+        self.file_config = Some(file_config);
         self
     }
 }

@@ -2,7 +2,7 @@ use crate::inference::{InferenceEngine, StreamCallback, StreamFrame, GenerationD
 use crate::gguf::Loader;
 use crate::tokenizer::{TokenizerServiceBuilder, TokenizerService};
 use crate::session::SessionManager;
-use crate::config::{GenerationOverrides, InferenceConfig};
+use crate::config::{GenerationOverrides, InferenceConfig, ComputeDtype, FileConfig, InferenceFileConfig};
 use crate::api::run_server;
 use crate::api::worker::EngineWorker;
 use candle_core::DType;
@@ -55,14 +55,18 @@ pub enum Commands {
         repetition_penalty: Option<f32>,
         #[arg(long = "seed")]
         seed: Option<usize>,
-        #[arg(short = 'd', long = "dtype", value_enum, default_value_t = ComputeDtype::F32)]
-        compute_dtype: ComputeDtype,
-        #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
-        max_seq_len: usize,
-        #[arg(short = 'f', long = "use_flash")]
-        use_flash: bool,
+        #[arg(short = 'd', long = "dtype", value_enum)]
+        compute_dtype: Option<ComputeDtype>,
+        #[arg(short = 'l', long = "max_seq_len")]
+        max_seq_len: Option<usize>,
+        #[arg(long = "conv_on_cpu")]
+        conv_on_cpu: Option<bool>,
+        #[arg(short = 'f', long = "flash_attn")]
+        flash_attn: Option<bool>,
         #[arg(short = 's', long = "stream")]
         stream: bool,
+        #[arg(short = 'c', long = "config")]
+        config_path: Option<OsString>,
     },
 
     /// Generate text applying chat template to the prompt
@@ -81,14 +85,18 @@ pub enum Commands {
         repetition_penalty: Option<f32>,
         #[arg(long = "seed")]
         seed: Option<usize>,
-        #[arg(short = 'd', long = "dtype", value_enum, default_value_t = ComputeDtype::F32)]
-        compute_dtype: ComputeDtype,
-        #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
-        max_seq_len: usize,
-        #[arg(short = 'f', long = "use_flash")]
-        use_flash: bool,
+        #[arg(short = 'd', long = "dtype", value_enum)]
+        compute_dtype: Option<ComputeDtype>,
+        #[arg(short = 'l', long = "max_seq_len")]
+        max_seq_len: Option<usize>,
+        #[arg(long = "conv_on_cpu")]
+        conv_on_cpu: Option<bool>,
+        #[arg(short = 'f', long = "flash_attn")]
+        flash_attn: Option<bool>,
         #[arg(short = 's', long = "stream")]
         stream: bool,
+        #[arg(short = 'c', long = "config")]
+        config_path: Option<OsString>,
     },
 
     /// Start the inference server
@@ -99,18 +107,18 @@ pub enum Commands {
         idle_timeout: u64,
         #[arg(short = 'p', long = "model_path")]
         model_path: Option<OsString>,
-        #[arg(short = 'd', long = "dtype", value_enum, default_value_t = ComputeDtype::F32)]
-        compute_dtype: ComputeDtype,
-        #[arg(short = 'l', long = "max_seq_len", default_value_t = 32_000)]
-        max_seq_len: usize,
+        #[arg(short = 'd', long = "dtype", value_enum)]
+        compute_dtype: Option<ComputeDtype>,
+        #[arg(short = 'l', long = "max_seq_len")]
+        max_seq_len: Option<usize>,
+        #[arg(long = "conv_on_cpu")]
+        conv_on_cpu: Option<bool>,
+        #[arg(short = 'f', long = "flash_attn")]
+        flash_attn: Option<bool>,
+        #[arg(short = 'c', long = "config")]
+        config_path: Option<OsString>,
     }   
     
-}
-
-#[derive(Debug, Copy, Clone, ValueEnum)]
-enum ComputeDtype {
-    F32,
-    F16
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -152,11 +160,21 @@ pub async fn run() -> anyhow::Result<()> {
             seed,
             compute_dtype,
             max_seq_len,
-            use_flash,
+            conv_on_cpu,
+            flash_attn,
             stream,
+            config_path,
         } => {
             let start = std::time::Instant::now();
-            let inferece_config = build_inference_config(compute_dtype, max_seq_len, true);
+            let mut inference_config_from_file = None;
+            let mut generation_config_from_file = None;
+            if let Some(config) = config_path {
+                let config_from_file = FileConfig::load(&config.to_string_lossy().replace('\\', "/"))?;
+                inference_config_from_file = config_from_file.inference_config;
+                generation_config_from_file = config_from_file.generation_config;
+            }
+
+            let inferece_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, inference_config_from_file);
             let inference_engine = init_inference_engine(
                 model_path, 
                 &inferece_config,
@@ -174,6 +192,7 @@ pub async fn run() -> anyhow::Result<()> {
                 None,
                 None,
                 seed,
+                generation_config_from_file,
             );
 
             println!("🦀 Generating: \"{}\"", prompt);
@@ -186,7 +205,6 @@ pub async fn run() -> anyhow::Result<()> {
             let report = inference_engine.generate_stream(
                 prompt.as_str(),
                 gen_overrides,
-                use_flash,
                 stream_callback,
             )?;
 
@@ -213,11 +231,21 @@ pub async fn run() -> anyhow::Result<()> {
             seed, 
             compute_dtype, 
             max_seq_len, 
-            use_flash, 
-            stream 
+            conv_on_cpu,
+            flash_attn,
+            stream,
+            config_path,
         } => {
             let start = std::time::Instant::now();
-            let inferece_config = build_inference_config(compute_dtype, max_seq_len, true);
+            let mut inference_config_from_file = None;
+            let mut generation_config_from_file = None;
+            if let Some(config) = config_path {
+                let config_from_file = FileConfig::load(&config.to_string_lossy().replace('\\', "/"))?;
+                inference_config_from_file = config_from_file.inference_config;
+                generation_config_from_file = config_from_file.generation_config;
+            }
+
+            let inferece_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, inference_config_from_file);
             let inference_engine = init_inference_engine(
                 model_path, 
                 &inferece_config,
@@ -235,6 +263,7 @@ pub async fn run() -> anyhow::Result<()> {
                 None,
                 None,
                 seed,
+                generation_config_from_file,
             );
 
             println!("🦀 Generating: \"{}\"", prompt);
@@ -255,7 +284,6 @@ pub async fn run() -> anyhow::Result<()> {
                 prompt_templated,
                 &[],
                 gen_overrides,
-                use_flash,
                 stream_callback,
             )?;
 
@@ -277,9 +305,19 @@ pub async fn run() -> anyhow::Result<()> {
             idle_timeout, 
             model_path, 
             compute_dtype, 
-            max_seq_len 
+            max_seq_len,
+            conv_on_cpu,
+            flash_attn,
+            config_path,
         } => {
-            let inference_config = build_inference_config(compute_dtype, max_seq_len, true);
+            let inference_config_from_file = if let Some(config) = config_path {
+                let config_from_file = FileConfig::load(&config.to_string_lossy().replace('\\', "/"))?;
+                config_from_file.inference_config
+            } else {
+                None
+            };
+
+            let inference_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, inference_config_from_file);
 
             let engine_opt = if let Some(model_path_str) = model_path {
                 Some(init_inference_engine(model_path_str, &inference_config)?)
@@ -298,16 +336,13 @@ pub async fn run() -> anyhow::Result<()> {
     anyhow::Ok(())
 }
 
-pub fn build_inference_config(compute_dtype: ComputeDtype, max_seq_len: usize, conv_on_cpu: bool) -> InferenceConfig {
-    let dtype = match compute_dtype {
-        ComputeDtype::F16 => DType::F16,
-        ComputeDtype::F32 => DType::F32,
-    };
-
+pub fn build_inference_config(compute_dtype: Option<ComputeDtype>, max_seq_len: Option<usize>, flash_attn: Option<bool>, conv_on_cpu: Option<bool>, config: Option<InferenceFileConfig>) -> InferenceConfig {
     InferenceConfig::builder()
-        .dtype(dtype)
+        .dtype(compute_dtype)
         .max_seq_len(max_seq_len)
+        .flash_attn(flash_attn)
         .conv_on_cpu(conv_on_cpu)
+        .with_file_config(config)
         .build()
 }
 

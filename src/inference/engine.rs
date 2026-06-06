@@ -41,7 +41,7 @@ impl<'a> InferenceEngineBuilder<'a> {
         self
     }
 
-    fn init_model(&self, model_config: &ModelConfig, device: &Device) -> Result<Box<dyn Model + Send + Sync>, LociError> {
+    fn init_model(&self, model_config: &ModelConfig, inference_config: &InferenceConfig, device: &Device) -> Result<Box<dyn Model + Send + Sync>, LociError> {
         let start_time = Instant::now();
         range_push!("VarBuilder Init");
         debug!("Creating VarBuilder...");
@@ -55,10 +55,7 @@ impl<'a> InferenceEngineBuilder<'a> {
 
         debug!("VarBuilder created");
         range_pop!();
-        let inference_config = match self.config.as_ref() {
-            Some(&config) => config,
-            None => &InferenceConfig::default(),
-        };
+
         let model = ModelBuilder::new(model_config.clone(), var_builder, inference_config).build()?;
         debug!("Model loaded in {:.3}s", start_time.elapsed().as_secs_f32());
         Ok(model)
@@ -100,7 +97,12 @@ impl<'a> InferenceEngineBuilder<'a> {
             arg_value_open_token_id: model_config.arg_value_open_token_id,
             arg_value_close_token_id: model_config.arg_value_close_token_id,
         };
-        let model = self.init_model(&model_config, &device)?;
+        let inference_config = match self.config.as_ref() {
+            Some(&config) => config,
+            None => &InferenceConfig::default(),
+        };
+        let flash_attn = inference_config.flash_attn;
+        let model = self.init_model(&model_config, inference_config, &device)?;
 
         Ok(InferenceEngine {
             tokenizer,
@@ -108,6 +110,7 @@ impl<'a> InferenceEngineBuilder<'a> {
             model_path: gguf_path.to_string_lossy().into(),
             vocab_size,
             model,
+            flash_attn,
             supports_reasoning,
             supports_tool_calling,
             flatten_tools_to_functions: model_config.flatten_tools_to_functions,
@@ -123,6 +126,7 @@ pub struct InferenceEngine {
     model_path: String,
     vocab_size: usize,
     model: Box<dyn Model + Send + Sync>,
+    flash_attn: bool,
     supports_reasoning: bool,
     supports_tool_calling: bool,
     flatten_tools_to_functions: bool,
@@ -144,38 +148,35 @@ impl InferenceEngine {
         messages: &[ChatMessage],
         tools: &[Tool],
         overrides: GenerationOverrides,
-        use_flash: bool,
         callback: StreamCallback,
     ) -> anyhow::Result<GenerationReport> 
     {
         let gen_config = self.gen_builder.clone().with_overrides(overrides).build();
         debug!("Generation parameters: {:#?}", gen_config);
-        debug!("Using flash attention: {}", use_flash);
+        debug!("Using flash attention: {}", self.flash_attn);
         let enable_thinking = self.supports_reasoning && gen_config.reasoning_effort != ReasoningEffort::None;
         let prompt = self.tokenizer.apply_chat_template(messages, tools, enable_thinking, self.flatten_tools_to_functions)?;
         debug!("Model prompt: {:#?}", prompt); 
         let encoding = self.tokenizer.encode(&prompt, false)?;
-        self.generate_from_encoding(encoding, gen_config, use_flash, callback)
+        self.generate_from_encoding(encoding, gen_config, callback)
     }
 
     pub fn generate_stream(
         &self,
         prompt: &str,
         overrides: GenerationOverrides,
-        use_flash: bool,
         callback: StreamCallback,
     ) -> anyhow::Result<GenerationReport> 
     {
         let gen_config = self.gen_builder.clone().with_overrides(overrides).build();
         let encoding = self.tokenizer.encode(&prompt, true)?;
-        self.generate_from_encoding(encoding, gen_config, use_flash, callback)
+        self.generate_from_encoding(encoding, gen_config, callback)
     }
 
     pub fn generate_from_encoding(
         &self,
         encoding: Encoding,
         gen_config: GenerationConfig,
-        use_flash: bool,
         mut callback: StreamCallback,
     ) -> anyhow::Result<GenerationReport> 
     {
@@ -205,7 +206,6 @@ impl InferenceEngine {
             tool_calling_supervisor,
             cache, 
             end_token,
-            use_flash
         );
 
         let mut stop_pattern_matcher = StopPatternMatcher::new(gen_config.stop_tokens, &self.tokenizer);
@@ -328,7 +328,7 @@ impl InferenceEngine {
         handler: &mut GenerationHandler,
     ) -> anyhow::Result<Tensor> {
         let input = Tensor::new(handler.input_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-        self.model.forward(&input, &mut handler.cache, handler.pos, handler.use_flash)
+        self.model.forward(&input, &mut handler.cache, handler.pos, self.flash_attn)
     }
 
     fn squeeze_logits(&self, logits: Tensor) -> anyhow::Result<Tensor> {

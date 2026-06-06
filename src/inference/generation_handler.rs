@@ -14,7 +14,6 @@ pub struct GenerationHandler<'a> {
     pub ongoing_gen_type: GenerationDataType,
     pub tokens_to_force: Vec<u32>,
     pub eos_token_id: u32,
-    pub use_flash: bool,
     pub pending_events: Vec<GenerationEvent>,
 }
 
@@ -26,7 +25,6 @@ impl<'a> GenerationHandler<'a> {
         mut tool_calling_supervisor: Option<ToolCallingSupervisor<'a>>,
         cache: Vec<Option<MixedCache>>,
         eos_token_id: u32,
-        use_flash: bool,
     )-> Self {
         let input_tokens = input_tokens.to_vec();
         input_tokens.iter().for_each(|&token| sampler.add_token(token));
@@ -78,7 +76,6 @@ impl<'a> GenerationHandler<'a> {
             ongoing_gen_type,
             tokens_to_force,
             eos_token_id,
-            use_flash,
             pending_events: Vec::with_capacity(4),
         }
     }
@@ -122,7 +119,6 @@ impl<'a> GenerationHandler<'a> {
             self.emit_event(GenerationEvent::GenerationStopped);
             return Ok(()); 
         }
-
         self.pos += 1;
         self.set_input_tokens(&[sampling_result.token]);
 

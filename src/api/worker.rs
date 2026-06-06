@@ -135,6 +135,7 @@ fn run_stream_generation(
         req.logprobs,
         req.top_logprobs,
         req.seed,
+        None,
     );
 
     // Setup initial chunk
@@ -181,7 +182,7 @@ fn run_stream_generation(
 
             Ok(())
         });
-    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, true, callback) {
+    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, callback) {
         Ok(report) => {
             let final_content_chunk = build_final_content_chunk(static_data.clone(), report.finish_reason.clone());
             if let Ok(final_chunk_event) = Event::default().json_data(final_content_chunk) {
@@ -361,10 +362,11 @@ fn run_single_generation(
         req.logprobs,
         req.top_logprobs,
         req.seed,
+        None,
     );
 
     let callback: StreamCallback = Box::new(|_| Ok(()));
-    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, true, callback) {
+    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, callback) {
         Ok(report) => {
             let chat_completion_response = build_chat_completion_response(&req.model, report);
             if let Ok(response_event) = Event::default().json_data(chat_completion_response) {

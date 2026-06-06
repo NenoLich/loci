@@ -1,0 +1,17 @@
+[inference]
+dtype = "f16"
+max_seq_len = 32000
+conv_on_cpu = true
+flash_attn = true
+
+[generation]
+system_message = "You are a helpfull assistant."
+temperature = 0.7
+top_p = 0.9
+max_tokens = 4096
+repetition_penalty = 1.15
+tool_choice = "auto"
+reasoning_effort = "high"
+logprobs = false
+top_logprobs = 5
+seed = 19

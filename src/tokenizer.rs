@@ -1,9 +1,11 @@
 use ahash::AHashMap;
 
 use tokenizers::pre_tokenizers::sequence::Sequence;
+use std::io;
 use std::io::{Write, ErrorKind, Error};
 use std::collections::{BTreeSet};
 use regex::Regex;
+use serde_json::ser::Formatter;
 
 use crate::error::LociError;
 use crate::gguf::{GgufInfo, GgufKVMeta};
@@ -55,6 +57,46 @@ impl StreamContext {
         self.pending_tokens.clear();
     }
 }
+
+
+
+#[derive(Clone, Copy, Debug)]
+pub struct SpacedFormatter;
+
+impl Formatter for SpacedFormatter {
+    #[inline]
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        writer.write_all(b": ")
+    }
+
+    #[inline]
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !first {
+            writer.write_all(b", ")
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !first {
+            writer.write_all(b", ")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 
 pub struct TokenizerService {
     tokenizer: Tokenizer,
@@ -163,7 +205,20 @@ impl TokenizerService {
             self.eom_token.get_or_try_init(|| self.decode(&[self.eom_token_id], false))?;
         
         // Build tools as list of JSON strings with proper field ordering
-        let tools_json_list = build_tools_json_list(raw_tools, flatten_tools_to_functions)?;
+        let tools_json_list = if flatten_tools_to_functions {
+            raw_tools.iter()
+                .map(|tool| {
+                    to_spaced_string(&tool.function)
+                })
+                .collect::<Result<Vec<String>, serde_json::Error>>()            
+
+        } else {
+            raw_tools.iter()
+                .map(|tool| {
+                    to_spaced_string(tool)
+                })
+                .collect::<Result<Vec<String>, serde_json::Error>>()         
+        }.map_err(|e| LociError::Tokenization { source: Box::new(e) })?;
 
         let rendered = template.render(context! {
             bos_token => bos_token,
@@ -181,78 +236,11 @@ impl TokenizerService {
     }
 }
 
-/// Build tools as list of JSON strings with proper field ordering
-fn build_tools_json_list(raw_tools: &[Tool], flatten: bool) -> Result<Vec<String>, LociError> {
-    raw_tools
-        .iter()
-        .map(|tool| {
-            let tool_value = if flatten {
-                serde_json::json!({
-                    "name": tool.function.name,
-                    "description": tool.function.description,
-                    "parameters": tool.function.parameters,
-                })
-            } else {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.function.name,
-                        "description": tool.function.description,
-                        "parameters": tool.function.parameters,
-                    }
-                })
-            };
-            serialize_json_with_order(&tool_value)
-        })
-        .collect()
-}
-
-/// Serialize JSON value with fields ordered: name → description → parameters (at all levels)
-fn serialize_json_with_order(value: &serde_json::Value) -> Result<String, LociError> {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut fields = Vec::new();
-            
-            // Priority order for top-level fields
-            let priority_keys = ["type", "name", "description", "function", "parameters", "properties", "required"];
-            for key in &priority_keys {
-                if let Some(val) = map.get(*key) {
-                    fields.push((key.to_string(), serialize_json_with_order(val)?));
-                }
-            }
-            
-            // Add remaining keys in iteration order
-            for (key, val) in map {
-                if !priority_keys.contains(&key.as_str()) {
-                    fields.push((key.clone(), serialize_json_with_order(val)?));
-                }
-            }
-            
-            let json_fields = fields
-                .into_iter()
-                .map(|(k, v)| format!("\"{}\": {}", escape_json_string(&k), v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Ok(format!("{{{}}}", json_fields))
-        }
-        serde_json::Value::Array(arr) => {
-            let items = arr
-                .iter()
-                .map(|v| serialize_json_with_order(v))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("[{}]", items.join(",")))
-        }
-        serde_json::Value::String(s) => Ok(format!("\"{}\"", escape_json_string(s))),
-        other => Ok(other.to_string()),
-    }
-}
-
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+fn to_spaced_string<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let mut buf = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, SpacedFormatter);
+    value.serialize(&mut serializer)?;
+    Ok(String::from_utf8(buf).unwrap())
 }
 
 pub struct TokenizerServiceBuilder {
