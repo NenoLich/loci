@@ -2,9 +2,11 @@ use crate::inference::{InferenceEngine, StreamCallback, StreamFrame, GenerationD
 use crate::gguf::Loader;
 use crate::tokenizer::{TokenizerServiceBuilder, TokenizerService};
 use crate::session::SessionManager;
-use crate::config::{GenerationOverrides, InferenceConfig, ComputeDtype, FileConfig, InferenceFileConfig};
+use crate::config::{GenerationOverrides, InferenceConfig, ComputeDtype, FileConfig, InferenceFileConfig, ModelCacheConfig, CacheFileConfig};
 use crate::api::run_server;
 use crate::api::worker::EngineWorker;
+use crate::error::LociError;
+use tokio_util::sync::CancellationToken;
 use candle_core::DType;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::rc::Rc;
@@ -115,6 +117,14 @@ pub enum Commands {
         conv_on_cpu: Option<bool>,
         #[arg(short = 'f', long = "flash_attn")]
         flash_attn: Option<bool>,
+        #[arg(long = "cache_dir")]
+        cache_dir: Option<OsString>,
+        #[arg(long = "max_cache_size")]
+        max_cache_size: Option<u64>,
+        #[arg(long = "min_cache_tokens")]
+        min_cache_tokens: Option<usize>,
+        #[arg(long = "prefix_caching")]
+        prefix_caching: Option<bool>,
         #[arg(short = 'c', long = "config")]
         config_path: Option<OsString>,
     }   
@@ -174,10 +184,11 @@ pub async fn run() -> anyhow::Result<()> {
                 generation_config_from_file = config_from_file.generation_config;
             }
 
-            let inferece_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, inference_config_from_file);
-            let inference_engine = init_inference_engine(
+            let inferece_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, None, inference_config_from_file);
+            let mut inference_engine = init_inference_engine(
                 model_path, 
-                &inferece_config,
+                Some(inferece_config),
+                None
             )?;
             let model_loading_time = start.elapsed().as_secs_f64();
 
@@ -200,7 +211,7 @@ pub async fn run() -> anyhow::Result<()> {
             let stream_callback: StreamCallback = if stream {
                 Box::new(stdout_callback)
             } else {
-                Box::new(|_| { anyhow::Ok(()) })
+                Box::new(|_| { Ok(()) })
             };
             let report = inference_engine.generate_stream(
                 prompt.as_str(),
@@ -245,10 +256,11 @@ pub async fn run() -> anyhow::Result<()> {
                 generation_config_from_file = config_from_file.generation_config;
             }
 
-            let inferece_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, inference_config_from_file);
-            let inference_engine = init_inference_engine(
+            let inferece_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, None, inference_config_from_file);
+            let mut inference_engine = init_inference_engine(
                 model_path, 
-                &inferece_config,
+                Some(inferece_config),
+                None
             )?;
             let model_loading_time = start.elapsed().as_secs_f64();
             
@@ -272,7 +284,7 @@ pub async fn run() -> anyhow::Result<()> {
             let stream_callback: StreamCallback = if stream {
                 Box::new(stdout_callback)
             } else {
-                Box::new(|_| { anyhow::Ok(()) })
+                Box::new(|_| { Ok(()) })
             };
 
             let mut session_manager = SessionManager::new();
@@ -308,55 +320,73 @@ pub async fn run() -> anyhow::Result<()> {
             max_seq_len,
             conv_on_cpu,
             flash_attn,
+            cache_dir,
+            max_cache_size,
+            min_cache_tokens,
+            prefix_caching,
             config_path,
         } => {
-            let inference_config_from_file = if let Some(config) = config_path {
+            let mut inference_config_from_file = None;
+            let mut model_cache_config_from_file = None;
+            if let Some(config) = config_path {
                 let config_from_file = FileConfig::load(&config.to_string_lossy().replace('\\', "/"))?;
-                config_from_file.inference_config
-            } else {
-                None
-            };
+                inference_config_from_file = config_from_file.inference_config;
+                model_cache_config_from_file = config_from_file.cache_config;
+            }
 
-            let inference_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, inference_config_from_file);
+            let inference_config = build_inference_config(compute_dtype, max_seq_len, flash_attn, conv_on_cpu, prefix_caching, inference_config_from_file);
+            let model_cache_config = ModelCacheConfig::builder()
+                .cache_dir(cache_dir)
+                .max_cache_size(max_cache_size)
+                .min_cache_tokens(min_cache_tokens)
+                .with_file_config(model_cache_config_from_file)
+                .build();
 
             let engine_opt = if let Some(model_path_str) = model_path {
-                Some(init_inference_engine(model_path_str, &inference_config)?)
+                Some(init_inference_engine(model_path_str, Some(inference_config.clone()), Some(model_cache_config.clone()))?)
             } else {
                 None
             };
 
+            let cancelation_token = CancellationToken::new();
             let (command_tx, command_rx) = tokio::sync::mpsc::channel(100);
-            let worker = EngineWorker::new(inference_config, engine_opt, command_rx, idle_timeout);
-            tokio::spawn(worker.run());
-            
-            run_server(command_tx, &bind).await?;
+            let worker = EngineWorker::new(inference_config, model_cache_config, engine_opt, command_rx, idle_timeout, cancelation_token.clone());
+            let worker_handle = tokio::spawn(worker.run());
+
+            run_server(command_tx.clone(), &bind, cancelation_token).await?;
+            drop(command_tx);
+
+            worker_handle.await?;
         },
     }
 
     anyhow::Ok(())
 }
 
-pub fn build_inference_config(compute_dtype: Option<ComputeDtype>, max_seq_len: Option<usize>, flash_attn: Option<bool>, conv_on_cpu: Option<bool>, config: Option<InferenceFileConfig>) -> InferenceConfig {
+pub fn build_inference_config(compute_dtype: Option<ComputeDtype>, max_seq_len: Option<usize>, flash_attn: Option<bool>, conv_on_cpu: Option<bool>, prefix_caching: Option<bool>, config: Option<InferenceFileConfig>) -> InferenceConfig {
     InferenceConfig::builder()
         .dtype(compute_dtype)
         .max_seq_len(max_seq_len)
         .flash_attn(flash_attn)
         .conv_on_cpu(conv_on_cpu)
+        .prefix_caching(prefix_caching)
         .with_file_config(config)
         .build()
 }
 
-pub fn init_inference_engine(model_path: OsString, config: &InferenceConfig) -> anyhow::Result<InferenceEngine> {
+pub fn init_inference_engine(model_path: OsString, inference_config: Option<InferenceConfig>, model_cache_config: Option<ModelCacheConfig>) -> anyhow::Result<InferenceEngine> {
     let path_str = model_path.to_string_lossy();
     let path_sanitized = path_str.replace('\\', "/");
 
     Ok(InferenceEngine::builder()
         .with_gguf_metadata(&path_sanitized)
-        .config(config)
-        .build()?)
+        .inference_config(inference_config)
+        .model_cache_config(model_cache_config)
+        .build()?
+    )
 }
 
-pub fn stdout_callback(stream_frame: StreamFrame) -> anyhow::Result<()> {
+pub fn stdout_callback(stream_frame: StreamFrame) -> Result<(), LociError> {
     let output_chunk = match stream_frame.output_type {
         GenerationDataType::DirectContent => stream_frame.output.green(),
         GenerationDataType::ToolCallName => {
@@ -384,6 +414,6 @@ pub fn stdout_callback(stream_frame: StreamFrame) -> anyhow::Result<()> {
 
     print!("{}", output_chunk);
     use std::io::Write;
-    std::io::stdout().flush()?;
-    anyhow::Ok(())
+    std::io::stdout().flush().map_err(|e| LociError::Stream(e.to_string()))?;
+    Ok(())
 }

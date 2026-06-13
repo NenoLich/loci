@@ -6,6 +6,7 @@ pub mod tool_calling_supervisor;
 pub mod tool_formatter;
 pub mod generation_handler;
 pub mod types;
+pub mod model_cache;
 
 pub use self::engine::InferenceEngine;
 pub use self::sampler::{InferenceSampler, SamplingResult};
@@ -14,4 +15,5 @@ pub use self::stop_pattern_matcher::StopPatternMatcher;
 pub use self::tool_calling_supervisor::ToolCallingSupervisor;
 pub use self::tool_formatter::{ToolFormatStyle, ToolArgFormatterBuilder, XmlArgPairsFormatter, EnclosedJsonFormatter, PythonCallFormatter, ToolArgFormatter};
 pub use self::generation_handler::GenerationHandler;
-pub use self::types::{DeviceManager, PostSamplingConfig, GenerationDataType, GenerationEvent, GenerationReport, StreamCallback, StreamFrame};
+pub use self::model_cache::{ModelCacheManager, MatchCacheResult};
+pub use self::types::{DeviceManager, PostSamplingConfig, GenerationDataType, GenerationEvent, GenerationReport, GenerationContext, StreamCallback, StreamFrame};

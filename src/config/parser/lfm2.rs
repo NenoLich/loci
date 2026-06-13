@@ -8,6 +8,7 @@ use crate::inference::ToolFormatStyle;
 pub struct Lfm2ExtraParameters;
 
 impl Lfm2ExtraParameters {
+    pub const CACHE_SEQ_LEN_DIM: usize = 2;
     pub const SUPPORTS_TOOL_CALLING: bool = true;
     pub const SUPPORTS_REASONING: bool = false;
     pub const TOOL_CALL_START_TOKEN_ID: Option<u32> = Some(10);
@@ -22,6 +23,8 @@ pub struct Lfm2Parser;
 
 impl Lfm2Parser {
     pub fn parse(gguf_info: &GgufInfo) -> anyhow::Result<ModelConfig> {
+        let architecture = ModelArchitecture::Lfm2;
+        let mut model_name = None;
         let mut hidden_size = None;
         let mut n_heads = None;
         let mut n_kv_heads = None;
@@ -36,6 +39,7 @@ impl Lfm2Parser {
         let metadata = &gguf_info.kv_meta;
         for entry in metadata {
             match entry.key.as_str() {
+                "general.name" => model_name = entry.value.as_string(),
                 "lfm2.embedding_length" => hidden_size = entry.value.as_usize(),
                 "lfm2.attention.head_count" => n_heads = entry.value.as_usize(),
                 "lfm2.attention.head_count_kv" => n_kv_heads = Some(Self::build_n_kv_count(entry)?),
@@ -85,7 +89,8 @@ impl Lfm2Parser {
 
         Ok(ModelConfig {
             file_path: PathBuf::from_str(gguf_info.headers.path.as_str())?,
-            architecture: ModelArchitecture::Lfm2,
+            architecture,
+            model_name: model_name.ok_or_else(|| anyhow::anyhow!("Missing general.name"))?,
             hidden_size: hidden_size.ok_or_else(|| anyhow::anyhow!("Missing embedding_length"))?,
             n_heads,
             n_kv_heads,
@@ -96,6 +101,7 @@ impl Lfm2Parser {
             rope_theta: rope_theta.ok_or_else(|| anyhow::anyhow!("Missing rope.freq_base"))?,
             max_seq_len: max_seq_len.ok_or_else(|| anyhow::anyhow!("Missing context_length"))?,
             rms_epsilon,
+            cache_seq_len_dim: Lfm2ExtraParameters::CACHE_SEQ_LEN_DIM,
             conv_l_cache,
             n_expert_used: None,
             n_expert_group: None,

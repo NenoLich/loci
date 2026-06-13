@@ -9,8 +9,6 @@ pub struct GenerationHandler<'a> {
     pub sampler: InferenceSampler,
     pub reasoning_supervisor: Option<ReasoningSupervisor>,
     pub tool_calling_supervisor: Option<ToolCallingSupervisor<'a>>,
-    pub cache: Vec<Option<MixedCache>>,
-    pub pos: usize,
     pub ongoing_gen_type: GenerationDataType,
     pub tokens_to_force: Vec<u32>,
     pub eos_token_id: u32,
@@ -23,11 +21,8 @@ impl<'a> GenerationHandler<'a> {
         mut sampler: InferenceSampler,
         mut reasoning_supervisor: Option<ReasoningSupervisor>,
         mut tool_calling_supervisor: Option<ToolCallingSupervisor<'a>>,
-        cache: Vec<Option<MixedCache>>,
         eos_token_id: u32,
     )-> Self {
-        let input_tokens = input_tokens.to_vec();
-        input_tokens.iter().for_each(|&token| sampler.add_token(token));
         let mut ongoing_gen_type = GenerationDataType::DirectContent;
         let mut tokens_to_force = vec![];
         if let Some(reasoning_supervisor) = reasoning_supervisor.as_mut() {
@@ -67,12 +62,10 @@ impl<'a> GenerationHandler<'a> {
 
 
         Self {
-            input_tokens,
+            input_tokens: input_tokens.to_vec(),
             sampler,
             reasoning_supervisor,
             tool_calling_supervisor,
-            cache,
-            pos: 0,
             ongoing_gen_type,
             tokens_to_force,
             eos_token_id,
@@ -119,7 +112,6 @@ impl<'a> GenerationHandler<'a> {
             self.emit_event(GenerationEvent::GenerationStopped);
             return Ok(()); 
         }
-        self.pos += 1;
         self.set_input_tokens(&[sampling_result.token]);
 
         if let Some(reasoning_supervisor) = self.reasoning_supervisor.as_mut() {

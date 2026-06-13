@@ -15,8 +15,13 @@ pub trait Model {
         use_flash: bool,
     ) -> anyhow::Result<Tensor>;
     fn init_cache(&self) -> anyhow::Result<Vec<Option<MixedCache>>>;
+    fn cache_seq_len_dim(&self) -> usize;
+    fn min_prefill_tokens(&self) -> usize {
+        1
+    }
 }
 
+#[derive(Debug, Clone)]
 pub enum MixedCache {
     KvCache(ConcatKvCache),
     ConvCache(Tensor),

@@ -1,10 +1,11 @@
 use crate::inference::{SamplingResult, ToolFormatStyle};
 use crate::api::types::{ChunkToolCall, LogprobsContent, ChatMessage, FinishReason, Usage, ToolCall, Role, CompletionTokensDetails};
 use crate::error::LociError;
+use crate::model::MixedCache;
 
 use candle_core::Device;
 
-pub type StreamCallback = Box<dyn for<'a> FnMut(StreamFrame<'a>) -> anyhow::Result<()>>;
+pub type StreamCallback = Box<dyn for<'a> FnMut(StreamFrame<'a>) -> Result<(), LociError>>;
 
 /// Events emitted by supervisors during token processing
 #[derive(Clone, Debug)]
@@ -39,6 +40,22 @@ pub enum GenerationDataType {
     ToolCallArguments,
 }
 
+pub struct GenerationContext {
+    pub model_name: String,
+    pub token_ids: Vec<u32>,
+    pub cache: Vec<Option<MixedCache>>,
+}
+
+impl GenerationContext {
+    pub fn new(model_name: &str) -> Self {
+        Self {
+            model_name: model_name.to_string(),
+            token_ids: Vec::new(),
+            cache: Vec::new(),
+        }
+    }
+}
+
 pub struct StreamFrame<'a> {
     pub output: &'a str,
     pub tool_call_chunk: Option<ChunkToolCall>,
@@ -46,6 +63,7 @@ pub struct StreamFrame<'a> {
     pub logprobs: Option<LogprobsContent>,
 }
 
+#[derive(Debug)]
 pub struct GenerationReport {
     pub chat_message: ChatMessage,
     pub finish_reason: FinishReason,

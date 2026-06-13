@@ -25,6 +25,7 @@ pub struct Deepseek2Model {
     embed_norm: RmsNorm,
     lm_head: QMatMul,
     compute_dtype: DType,
+    cache_seq_len_dim: usize,
 }
 
 pub struct Deepseek2Layer {
@@ -542,6 +543,10 @@ impl Model for Deepseek2Model {
 
         Ok(logits)
     }
+
+    fn cache_seq_len_dim(&self) -> usize {
+        self.cache_seq_len_dim
+    }
 }
 
 impl Deepseek2Model {
@@ -609,6 +614,7 @@ impl Deepseek2Model {
             embed_norm,
             lm_head,
             compute_dtype,
+            cache_seq_len_dim: config.cache_seq_len_dim,
         })
     }
 

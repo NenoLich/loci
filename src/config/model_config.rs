@@ -37,6 +37,7 @@ impl fmt::Display for ModelArchitecture {
 pub struct ModelConfig {
     pub file_path: PathBuf,
     pub architecture: ModelArchitecture,
+    pub model_name: String,
     pub hidden_size: usize,
     pub n_heads: usize,
     pub n_kv_heads: Vec<usize>,
@@ -46,6 +47,7 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub max_seq_len: usize,
     pub rms_epsilon: f32,
+    pub cache_seq_len_dim: usize,
     pub conv_l_cache: Option<usize>,
     pub n_expert_used: Option<usize>,
     pub n_expert_group: Option<usize>,

@@ -1,4 +1,5 @@
 use thiserror::Error;
+use std::path::Path;
 
 pub trait LociContext<T> {
     fn io_ctx(self, ctx: &'static str) -> Result<T, LociError>;
@@ -26,6 +27,21 @@ pub enum LociError {
     #[error("Failed to load model: {0}")]
     ModelLoad(String),
 
+    #[error("{0}")]
+    Cache(String),
+
+    #[error("Failed to load cache: {0}")]
+    CacheLoad(String),
+
+    #[error("Inference error: {source}")]
+    Inference{
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("Stream error: {0}")]
+    Stream(String),
+
     #[error("Tokenizer build error: {reason}")]
     TokenizerBuild { reason: String },
 
@@ -38,8 +54,11 @@ pub enum LociError {
     #[error("Invalid file format: {0}")]
     InvalidFileFormat(String),
 
-    #[error("Configuration error: {0}")]
-    Config(String),
+    #[error("Configuration error: {source}")]
+    Config {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[error("Invalid {file_type} metadata for field '{field}' at offset {offset}")]
     InvalidFileMetadata {

@@ -4,3 +4,4 @@
 /.private
 /.profile
 /.cargo
+/model_cache

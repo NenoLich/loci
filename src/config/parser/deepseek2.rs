@@ -8,6 +8,7 @@ use crate::inference::ToolFormatStyle;
 pub struct DeepSeek2ExtraParameters;
 
 impl DeepSeek2ExtraParameters {
+    pub const CACHE_SEQ_LEN_DIM: usize = 2;
     pub const SUPPORTS_TOOL_CALLING: bool = true;
     pub const SUPPORTS_REASONING: bool = true;
     pub const TOOL_CALL_START_TOKEN_ID: Option<u32> = Some(151352);
@@ -26,6 +27,7 @@ pub struct Deepseek2Parser;
 impl Deepseek2Parser {
     pub fn parse(gguf_info: &GgufInfo) -> anyhow::Result<ModelConfig> {
         let architecture = ModelArchitecture::Deepseek2;
+        let mut model_name = None;
         let mut n_layers = None;
         let mut max_seq_len = None;
         let mut hidden_size = None;
@@ -53,10 +55,10 @@ impl Deepseek2Parser {
         let mut expert_weights_norm = None;
         let mut n_rope_dims = None;
 
-
         let metadata = &gguf_info.kv_meta;
         for entry in metadata {
             match entry.key.as_str() {
+                "general.name" => model_name = entry.value.as_string(),
                 "deepseek2.block_count" => n_layers = entry.value.as_usize(),
                 "deepseek2.context_length" => max_seq_len = entry.value.as_usize(),
                 "deepseek2.embedding_length" => hidden_size = entry.value.as_usize(),
@@ -118,6 +120,7 @@ impl Deepseek2Parser {
         Ok(ModelConfig {
             file_path: PathBuf::from_str(gguf_info.headers.path.as_str())?,
             architecture,
+            model_name: model_name.ok_or_else(|| anyhow::anyhow!("Missing general.name"))?,
             hidden_size: hidden_size.ok_or_else(|| anyhow::anyhow!("Missing embedding_length"))?,
             n_heads,
             n_kv_heads,
@@ -128,6 +131,7 @@ impl Deepseek2Parser {
             rope_theta: rope_theta.ok_or_else(|| anyhow::anyhow!("Missing rope.freq_base"))?,
             max_seq_len: max_seq_len.ok_or_else(|| anyhow::anyhow!("Missing context_length"))?,
             rms_epsilon,
+            cache_seq_len_dim:DeepSeek2ExtraParameters::CACHE_SEQ_LEN_DIM,
             conv_l_cache: None,
             n_expert_used,
             n_expert_group,

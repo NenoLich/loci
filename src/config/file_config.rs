@@ -23,8 +23,11 @@ impl Display for ComputeDtype {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileConfig {
+    #[serde(rename = "generation_config", alias = "generation")]
     pub generation_config: Option<GenerationFileConfig>,
+    #[serde(rename = "inference_config", alias = "inference")]
     pub inference_config: Option<InferenceFileConfig>,
+    #[serde(rename = "cache_config", alias = "cache")]
     pub cache_config: Option<CacheFileConfig>,
 }
 
@@ -32,7 +35,7 @@ impl FileConfig {
     pub fn load(filename: impl AsRef<Path>) -> Result<Self, LociError> {
         let config = std::fs::read_to_string(filename)
             .map_err(|e| LociError::Io(e))?;
-        Ok(toml::from_str(&config).map_err(|e| LociError::Config(e.to_string()))?)
+        Ok(toml::from_str(&config).map_err(|e| LociError::Config{ source: Box::new(e) })?)
     }
 }
 
@@ -56,7 +59,12 @@ pub struct InferenceFileConfig {
     pub max_seq_len: Option<usize>,
     pub conv_on_cpu: Option<bool>,
     pub flash_attn: Option<bool>,
+    pub prefix_caching: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CacheFileConfig;
+pub struct CacheFileConfig {
+    pub cache_dir: Option<String>,
+    pub max_cache_size: Option<u64>,
+    pub min_cache_tokens: Option<usize>,
+}

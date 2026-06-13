@@ -8,13 +8,16 @@ impl InferenceConfigDefaults {
     pub const MAX_SEQ_LEN: usize = 32_000;
     pub const FLASH_ATTN: bool = true;
     pub const CONV_ON_CPU: bool = true;
+    pub const PREFIX_CACHING: bool = false;
 }
 
+#[derive(Debug, Clone)]
 pub struct InferenceConfig {
     pub dtype: DType,
     pub max_seq_len: usize,
     pub flash_attn: bool,
-    pub conv_on_cpu: bool
+    pub conv_on_cpu: bool,
+    pub prefix_caching: bool,
 }
 
 impl Default for InferenceConfig {
@@ -25,7 +28,7 @@ impl Default for InferenceConfig {
 
 impl InferenceConfig {
     pub fn builder() -> InferenceConfigBuilder {
-        InferenceConfigBuilder::new()
+        InferenceConfigBuilder::default()
     }
 }
 
@@ -35,14 +38,11 @@ pub struct InferenceConfigBuilder {
     pub max_seq_len: Option<usize>,
     pub flash_attn: Option<bool>,
     pub conv_on_cpu: Option<bool>,
+    pub prefix_caching: Option<bool>,
     pub file_config: Option<InferenceFileConfig>
 }
 
 impl InferenceConfigBuilder {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
     pub fn dtype(mut self, compute_dtype: Option<ComputeDtype>) -> Self {
         if let Some(dtype) = compute_dtype {
             self.dtype = match dtype {
@@ -66,6 +66,11 @@ impl InferenceConfigBuilder {
 
     pub fn conv_on_cpu(mut self, conv_on_cpu: Option<bool>) -> Self {
         self.conv_on_cpu = conv_on_cpu;
+        self
+    }
+
+    pub fn prefix_caching(mut self, prefix_caching: Option<bool>) -> Self {
+        self.prefix_caching = prefix_caching;
         self
     }
 
@@ -93,6 +98,9 @@ impl InferenceConfigBuilder {
             conv_on_cpu: self.conv_on_cpu
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.conv_on_cpu))
                 .unwrap_or(InferenceConfigDefaults::CONV_ON_CPU),
+            prefix_caching: self.prefix_caching
+                .or_else(|| self.file_config.as_ref().and_then(|c| c.prefix_caching))
+                .unwrap_or(InferenceConfigDefaults::PREFIX_CACHING),
         }
     }
 }

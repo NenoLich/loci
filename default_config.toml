@@ -3,6 +3,7 @@ dtype = "f16"
 max_seq_len = 32000
 conv_on_cpu = true
 flash_attn = true
+prefix_caching = true
 
 [generation]
 system_message = "You are a helpfull assistant."
@@ -15,3 +16,8 @@ reasoning_effort = "high"
 logprobs = false
 top_logprobs = 5
 seed = 19
+
+[cache]
+cache_dir = "model_cache"
+max_cache_size = 16_000_000_000
+min_cache_tokens = 52

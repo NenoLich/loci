@@ -36,6 +36,10 @@ pub struct Lfm2Model {
     pub lm_head: QMatMul,
     /// Data type used for computations (F16, BF16, or F32)
     pub compute_dtype: DType,
+    /// kv sequence lentgh dimension
+    pub cache_seq_len_dim: usize,
+    /// Minimum input tokens needed for conv cache init (max conv_l_cache - 1 across layers)
+    pub min_prefill_tokens: usize,
 }
 
 /// A single transformer layer in the LFM2 model.
@@ -582,7 +586,6 @@ impl Model for Lfm2Model {
         range_push!("Embed step");
         let mut x = self.embed_layer.forward(input)?.to_dtype(self.compute_dtype)?;
         range_pop!();
-
         // 2. Transformer layers
         range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
@@ -619,6 +622,14 @@ impl Model for Lfm2Model {
             })
             .collect();
         Ok(caches)
+    }
+
+    fn cache_seq_len_dim(&self) -> usize {
+        self.cache_seq_len_dim
+    }
+
+    fn min_prefill_tokens(&self) -> usize {
+        self.min_prefill_tokens
     }
 }
 
@@ -695,12 +706,17 @@ impl Lfm2Model {
             })
             .collect::<anyhow::Result<Vec<Lfm2Layer>>>()?;
 
+        // Find minimum prefill tokens for conv layers (each conv needs kernel_size-1 context)
+        let min_prefill_tokens = config.conv_l_cache.map(|c| c.saturating_sub(1)).unwrap_or(1);
+
         Ok(Self {
             embed_layer,
             embed_norm,
             layers,
             lm_head,
             compute_dtype,
+            cache_seq_len_dim: config.cache_seq_len_dim,
+            min_prefill_tokens,
         })
     }
 
