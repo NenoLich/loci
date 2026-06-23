@@ -1,28 +1,22 @@
 use candle_core::DType;
 use crate::config::{ComputeDtype, FileConfig, InferenceFileConfig};
 
-pub struct InferenceConfigDefaults;
-
-impl InferenceConfigDefaults {
-    pub const DTYPE: DType = DType::F16;
-    pub const MAX_SEQ_LEN: usize = 32_000;
-    pub const FLASH_ATTN: bool = true;
-    pub const CONV_ON_CPU: bool = true;
-    pub const PREFIX_CACHING: bool = false;
-}
-
 #[derive(Debug, Clone)]
 pub struct InferenceConfig {
     pub dtype: DType,
     pub max_seq_len: usize,
     pub flash_attn: bool,
     pub conv_on_cpu: bool,
-    pub prefix_caching: bool,
 }
 
 impl Default for InferenceConfig {
     fn default() -> Self {
-        Self::builder().build()
+        Self {
+            dtype: DType::F16,
+            max_seq_len: 32_000,
+            flash_attn: true,
+            conv_on_cpu: true 
+        }
     }
 }
 
@@ -38,7 +32,6 @@ pub struct InferenceConfigBuilder {
     pub max_seq_len: Option<usize>,
     pub flash_attn: Option<bool>,
     pub conv_on_cpu: Option<bool>,
-    pub prefix_caching: Option<bool>,
     pub file_config: Option<InferenceFileConfig>
 }
 
@@ -69,17 +62,13 @@ impl InferenceConfigBuilder {
         self
     }
 
-    pub fn prefix_caching(mut self, prefix_caching: Option<bool>) -> Self {
-        self.prefix_caching = prefix_caching;
-        self
-    }
-
     pub fn with_file_config(mut self, config: Option<InferenceFileConfig>) -> Self {
         self.file_config = config;
         self
     }
 
     pub fn build(self) -> InferenceConfig {
+        let default = InferenceConfig::default();
         InferenceConfig {
             dtype: self.dtype
                 .or_else(|| self.file_config.as_ref().and_then(|c| 
@@ -88,19 +77,16 @@ impl InferenceConfigBuilder {
                         Some(ComputeDtype::F32) => Some(DType::F32),
                         _ => None,
                 }))
-                .unwrap_or(InferenceConfigDefaults::DTYPE),
+                .unwrap_or(default.dtype),
             max_seq_len: self.max_seq_len
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.max_seq_len))
-                .unwrap_or(InferenceConfigDefaults::MAX_SEQ_LEN),
+                .unwrap_or(default.max_seq_len),
             flash_attn: self.flash_attn
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.flash_attn))
-                .unwrap_or(InferenceConfigDefaults::FLASH_ATTN),
+                .unwrap_or(default.flash_attn),
             conv_on_cpu: self.conv_on_cpu
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.conv_on_cpu))
-                .unwrap_or(InferenceConfigDefaults::CONV_ON_CPU),
-            prefix_caching: self.prefix_caching
-                .or_else(|| self.file_config.as_ref().and_then(|c| c.prefix_caching))
-                .unwrap_or(InferenceConfigDefaults::PREFIX_CACHING),
+                .unwrap_or(default.conv_on_cpu),
         }
     }
 }

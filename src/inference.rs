@@ -7,13 +7,15 @@ pub mod tool_formatter;
 pub mod generation_handler;
 pub mod types;
 pub mod model_cache;
+pub mod generation_context;
 
 pub use self::engine::InferenceEngine;
-pub use self::sampler::{InferenceSampler, SamplingResult};
+pub use self::sampler::{InferenceSampler, SamplingResult, Sampler};
 pub use self::reasoning_supervisor::ReasoningSupervisor;
 pub use self::stop_pattern_matcher::StopPatternMatcher;
 pub use self::tool_calling_supervisor::ToolCallingSupervisor;
 pub use self::tool_formatter::{ToolFormatStyle, ToolArgFormatterBuilder, XmlArgPairsFormatter, EnclosedJsonFormatter, PythonCallFormatter, ToolArgFormatter};
 pub use self::generation_handler::GenerationHandler;
-pub use self::model_cache::{ModelCacheManager, MatchCacheResult};
-pub use self::types::{DeviceManager, PostSamplingConfig, GenerationDataType, GenerationEvent, GenerationReport, GenerationContext, StreamCallback, StreamFrame};
+pub use self::model_cache::{ModelCacheManager, CacheMetadata, LoadedMixedCache};
+pub use self::types::{DeviceManager, PostSamplingConfig, GenerationDataType, GenerationEvent, GenerationReport, StreamCallback, StreamFrame};
+pub use self::generation_context::GenerationContext;

@@ -6,6 +6,14 @@ use crate::error::LociError;
 use crate::config::{ModelArchitecture, ModelConfig, InferenceConfig};
 use crate::model::{Lfm2Model, Deepseek2Model};
 
+#[derive(Debug, Clone)]
+pub struct ModelCacheInfo {
+    pub cache_type: ModelCacheType,
+    pub cache_seq_len_dim: usize,
+    pub cache_block_size_hint: usize,
+    pub n_layers: usize,
+}
+
 pub trait Model {
     fn forward(
         &self,
@@ -19,6 +27,32 @@ pub trait Model {
     fn min_prefill_tokens(&self) -> usize {
         1
     }
+    fn conv_on_cpu(&self) -> bool {
+        false
+    }
+    fn cache_block_size_hint(&self) -> usize {
+        1
+    }
+    fn model_cache_type(&self) -> ModelCacheType {
+        ModelCacheType::FullAttn
+    }
+
+    fn n_layers(&self) -> usize;
+
+    fn cache_info(&self) -> ModelCacheInfo {
+        ModelCacheInfo {
+            cache_type: self.model_cache_type(),
+            cache_seq_len_dim: self.cache_seq_len_dim(),
+            cache_block_size_hint: self.cache_block_size_hint(),
+            n_layers: self.n_layers(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelCacheType {
+    FullAttn,
+    MixedWithConv{conv_l_cache: usize},
 }
 
 #[derive(Debug, Clone)]

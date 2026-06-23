@@ -10,13 +10,13 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 use candle_flash_attn::flash_attn;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use tracing::debug;
-use nvtx::{range, range_push, range_pop};
+use tracing::{debug, trace_span};
+use nvtx::{range_push, range_pop};
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
 
 use crate::model::{Model, MixedCache};
-use crate::model::utility::{get_tensor, find_norm_prefix, repeat_kv, nonzero_1d, qmatmul_forward, RotaryEmbedding};
+use crate::model::utility::{get_tensor, find_norm_prefix, repeat_kv, nonzero_1d, qmatmul_forward, get_mask, update_cache, RotaryEmbedding};
 use crate::config::ModelConfig;
 
 pub struct Deepseek2Model {
@@ -150,7 +150,7 @@ impl Deepseek2Attn {
         ], candle_core::D::Minus1)?
         .contiguous()?;
 
-        let (k_states, v_states) = self.update_cache(key_states, value_states, cache)?;
+        let (k_states, v_states) = update_cache(key_states, value_states, cache)?;
         let k_states = k_states.contiguous()?;
         let v_states = v_states.contiguous()?;
 
@@ -161,21 +161,6 @@ impl Deepseek2Attn {
         // Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
         let attn = attn.reshape((b, s, self.v_head_dim * self.n_heads))?.contiguous()?;
         Ok(qmatmul_forward(&self.o_proj, &attn)?)
-    }
-
-    /// Update KV cache with new keys and values.
-    fn update_cache(
-        &self,
-        k: Tensor,
-        v: Tensor,
-        cache: &mut Option<MixedCache>,
-    ) -> anyhow::Result<(Tensor, Tensor)> {
-        match cache {
-            Some(MixedCache::KvCache(kv_cache)) => {
-                kv_cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?).map_err(anyhow::Error::msg)
-            }
-            _ => Ok((k, v)),
-        }
     }
 
     fn compute_attention(
@@ -252,7 +237,7 @@ impl Deepseek2Attn {
 
         // Apply causal mask for sequences longer than 1 token
         let attn = if seq_len > 1 {
-            let mask = self.get_mask(seq_len, compute_dtype, q.device())?;
+            let mask = get_mask(&self.mask_indices, self.max_seq_len, seq_len, compute_dtype, q.device())?;
             let attn = attn.to_dtype(compute_dtype)?;
             attn.broadcast_add(&mask)?.to_dtype(DType::F32)?
         } else {
@@ -267,34 +252,6 @@ impl Deepseek2Attn {
         Ok(y_t.to_dtype(compute_dtype)?.transpose(1, 2)?)
     }
 
-    /// Get or create the causal attention mask for the given sequence length.
-    fn get_mask(
-        &self,
-        seq_len: usize,
-        dtype: DType,
-        device: &Device,
-    ) -> anyhow::Result<Tensor> {
-        // Lazily initialize the mask indices
-        let indices = self.mask_indices.get_or_try_init(|| {
-            Tensor::arange(0u32, self.max_seq_len as u32, device)
-        })?;
-        let idx = indices.narrow(0, 0, seq_len)?;
-
-        // Create causal mask: positions i < j should be masked
-        let i = idx.reshape((seq_len, 1))?.broadcast_as((seq_len, seq_len))?;
-        let j = idx.reshape((1, seq_len))?.broadcast_as((seq_len, seq_len))?;
-        let mask = i.lt(&j)?;
-
-        // Apply mask: masked positions get -inf, others get 0
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?
-            .to_dtype(dtype)?
-            .broadcast_as((seq_len, seq_len))?;
-        let zeros = Tensor::new(0f32, device)?
-            .to_dtype(dtype)?
-            .broadcast_as((seq_len, seq_len))?;
-
-        Ok(mask.where_cond(&neg_inf, &zeros)?)
-    }
 }
 
 pub enum Deepseek2FfnMixer {
@@ -526,13 +483,14 @@ impl Model for Deepseek2Model {
         // 2. Transformer layers
         range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(
+            let layer_span = trace_span!("layer", layer = i);
+            x = layer_span.in_scope(|| layer.forward(
                 &x,
                 cache.get_mut(i).unwrap(),
                 pos,
                 self.compute_dtype,
                 use_flash,
-            )?;
+            ))?;
         }
         range_pop!();
 
@@ -547,6 +505,10 @@ impl Model for Deepseek2Model {
     fn cache_seq_len_dim(&self) -> usize {
         self.cache_seq_len_dim
     }
+
+    fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
 }
 
 impl Deepseek2Model {
@@ -556,7 +518,7 @@ impl Deepseek2Model {
         compute_dtype: DType,
         requested_max_seq_len: usize,
     ) -> anyhow::Result<Self> {
-        let _range = range!("Deepseek2Model loading");
+        range_push!("Deepseek2Model loading");
         debug!("Deepseek2 model load started...");
         let device = var_builder.device();
         let hidden_size = config.hidden_size;
@@ -608,6 +570,7 @@ impl Deepseek2Model {
             })
             .collect::<anyhow::Result<Vec<Deepseek2Layer>>>()?;
         debug!("Layers loaded");
+        range_pop!();
         Ok(Self {
             embed_layer,
             layers,

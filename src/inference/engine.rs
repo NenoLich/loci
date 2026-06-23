@@ -1,28 +1,23 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use std::rc::Rc;
 use std::mem::take;
 
 use crate::error::LociError;
 use crate::gguf::{GgufInfo, Loader};
 use crate::model::{MixedCache, Model, ModelBuilder};
-use crate::config::{ModelConfig, GenerationConfig, InferenceConfig, GenerationOverrides, GenerationConfigBuilder, ModelCacheConfig};
-use crate::tokenizer::{StreamContext, TokenizerService, TokenizerServiceBuilder};
-use crate::api::types::{Role, ChatMessage, Tool, FinishReason, ReasoningEffort, Usage, CompletionTokensDetails, LogprobsContent, TopLogprobs, ChunkToolCall, ToolCall};
-use crate::inference::{DeviceManager, InferenceSampler, ReasoningSupervisor, ToolCallingSupervisor, StopPatternMatcher, SamplingResult, ToolFormatStyle, GenerationDataType, GenerationEvent, GenerationReport, StreamCallback, PostSamplingConfig, StreamFrame, GenerationHandler, ModelCacheManager, MatchCacheResult, GenerationContext};
-use candle_core::{DType, Device, Tensor};
-use candle_transformers::generation::LogitsProcessor;
+use crate::config::{ModelConfig, GenerationConfig, InferenceConfig, GenerationOverrides, GenerationConfigBuilder};
+use crate::tokenizer::{StreamContext, TokenizerService, TokenizerServiceBuilder, Tokenizer};
+use crate::types::{Role, ChatMessage, Tool, FinishReason, ReasoningEffort, Usage, CompletionTokensDetails, LogprobsContent, TopLogprobs, ChunkToolCall, ToolCall};
+use crate::inference::{DeviceManager, InferenceSampler, Sampler, ReasoningSupervisor, ToolCallingSupervisor, StopPatternMatcher, SamplingResult, ToolFormatStyle, GenerationDataType, GenerationEvent, GenerationReport, StreamCallback, PostSamplingConfig, StreamFrame, GenerationHandler, GenerationContext};
+use candle_core::{Device, Tensor};
 use candle_transformers::quantized_var_builder::VarBuilder;
-use tokenizers::tokenizer::Encoding;
 use memmap2::MmapOptions;
-use once_cell::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::{debug, debug_span};
 use nvtx::{range_push, range_pop};
 
 pub struct InferenceEngineBuilder {
     gguf_path: Option<PathBuf>,
     inference_config: Option<InferenceConfig>,
-    model_cache_config: Option<ModelCacheConfig>
 }
 
 impl InferenceEngineBuilder {
@@ -30,7 +25,6 @@ impl InferenceEngineBuilder {
         Self {
             gguf_path: None,
             inference_config: None,
-            model_cache_config: None
         }
     }
 
@@ -44,11 +38,6 @@ impl InferenceEngineBuilder {
         self
     }
 
-    pub fn model_cache_config(mut self, model_cache_config: Option<ModelCacheConfig>) -> Self {
-        self.model_cache_config = model_cache_config;
-        self
-    }
-
     fn init_model(&self, model_config: &ModelConfig, inference_config: &InferenceConfig, device: &Device) -> Result<Box<dyn Model + Send + Sync>, LociError> {
         let start_time = Instant::now();
         range_push!("VarBuilder Init");
@@ -58,13 +47,17 @@ impl InferenceEngineBuilder {
             MmapOptions::new().map(&file)
                 .map_err(|e| LociError::ModelLoad(e.to_string()))?
         };
-        let var_builder = VarBuilder::from_gguf_buffer(&mmap, device)
-            .map_err(|e| LociError::ModelLoad(e.to_string()))?;
-
+        let var_builder = debug_span!("VarBuilder init").in_scope(||
+            VarBuilder::from_gguf_buffer(&mmap, device)
+                .map_err(|e| LociError::ModelLoad(e.to_string()))
+        )?;
+        
         debug!("VarBuilder created");
         range_pop!();
 
-        let model = ModelBuilder::new(model_config.clone(), var_builder, inference_config).build()?;
+        let model = debug_span!("Model load").in_scope(||
+            ModelBuilder::new(model_config.clone(), var_builder, inference_config).build()
+        )?;
         debug!("Model loaded in {:.3}s", start_time.elapsed().as_secs_f32());
         Ok(model)
     }
@@ -73,6 +66,8 @@ impl InferenceEngineBuilder {
         let gguf_path = self.gguf_path.as_deref().ok_or_else(|| {
             LociError::ModelLoad("gguf_path is required but was not set".into())
         })?;
+        let model_path = &gguf_path.to_string_lossy();
+        let (_, model_name) = model_path.rsplit_once(&['/', '\\']).unwrap_or(("", &model_path));
 
         let gguf_info = Loader::load_gguf_info(gguf_path, 0, false)?;
 
@@ -87,11 +82,11 @@ impl InferenceEngineBuilder {
         range_pop!();
         let device = DeviceManager::select()?;
 
+
         let model_config = ModelConfig::from_gguf_info(&gguf_info).map_err(|e| {
             LociError::ModelLoad(format!("failed to parse model config: {}", e))
         })?;
 
-        let model_name = model_config.model_name.clone();
         let vocab_size = model_config.vocab_size;
         let supports_reasoning = model_config.supports_reasoning;
         let supports_tool_calling = model_config.supports_tool_calling;
@@ -111,32 +106,16 @@ impl InferenceEngineBuilder {
             None => &InferenceConfig::default(),
         };
         let flash_attn = inference_config.flash_attn;
-        let prefix_caching = inference_config.prefix_caching;
-        let generation_context = GenerationContext::new(&model_name);
 
         let model = self.init_model(&model_config, inference_config, &device)?;
 
-        let model_cache_config = match self.model_cache_config {
-            Some(config) => config,
-            None => ModelCacheConfig::default(),
-        };
-
-        let model_cache_manager = ModelCacheManager::builder(&model_name)
-            .with_config(model_cache_config)
-            .prefix_caching(prefix_caching)
-            .build()
-            .map_err(|e| LociError::Cache(e.to_string()))?;
-
         Ok(InferenceEngine {
-            tokenizer,
-            model_cache_manager,
-            generation_context,
+            tokenizer: Box::new(tokenizer) as Box<dyn Tokenizer + Send + Sync>,
             device,
-            model_path: gguf_path.to_string_lossy().into(),
+            model_name: model_name.to_string(),
             vocab_size,
             model,
             flash_attn,
-            prefix_caching,
             supports_reasoning,
             supports_tool_calling,
             flatten_tools_to_functions: model_config.flatten_tools_to_functions,
@@ -147,15 +126,12 @@ impl InferenceEngineBuilder {
 }
 
 pub struct InferenceEngine {
-    tokenizer: TokenizerService,
-    model_cache_manager: ModelCacheManager,
-    generation_context: GenerationContext,
+    tokenizer: Box<dyn Tokenizer + Send + Sync>,
     device: Device,
-    model_path: String,
+    model_name: String,
     vocab_size: usize,
     model: Box<dyn Model + Send + Sync>,
     flash_attn: bool,
-    prefix_caching: bool,
     supports_reasoning: bool,
     supports_tool_calling: bool,
     flatten_tools_to_functions: bool,
@@ -168,14 +144,19 @@ impl InferenceEngine {
         InferenceEngineBuilder::new()
     }
 
-    pub fn model_path(&self) -> String {
-        self.model_path.clone()
+    pub fn model_name(&self) -> String {
+        self.model_name.clone()
+    }
+
+    pub fn model_cache_info(&self) -> crate::model::ModelCacheInfo {
+        self.model.cache_info()
     }
 
     pub fn generate_chat_stream(
-        &mut self,
+        &self,
         messages: &[ChatMessage],
         tools: &[Tool],
+        ctx: &mut GenerationContext,
         overrides: GenerationOverrides,
         callback: StreamCallback,
     ) -> Result<GenerationReport, LociError> 
@@ -186,49 +167,60 @@ impl InferenceEngine {
         let enable_thinking = self.supports_reasoning && gen_config.reasoning_effort != ReasoningEffort::None;
         let prompt = self.tokenizer.apply_chat_template(messages, tools, enable_thinking, self.flatten_tools_to_functions)?;
         debug!("Model prompt: {:#?}", prompt); 
-        let encoding = self.tokenizer.encode(&prompt, false)?;
-        self.generate_from_encoding(encoding, gen_config, callback)
+        let prompt_token_ids = self.tokenizer.encode(&prompt, false)?;
+        self.generate_from_encoding(prompt_token_ids, ctx, gen_config, callback)
     }
 
     pub fn generate_stream(
-        &mut self,
+        &self,
         prompt: &str,
+        ctx: &mut GenerationContext,
         overrides: GenerationOverrides,
         callback: StreamCallback,
     ) -> Result<GenerationReport, LociError> 
     {
         let gen_config = self.gen_builder.clone().with_overrides(overrides).build();
-        let encoding = self.tokenizer.encode(&prompt, true)?;
-        self.generate_from_encoding(encoding, gen_config, callback)
+        let prompt_token_ids = self.tokenizer.encode(&prompt, true)?;
+        self.generate_from_encoding(prompt_token_ids, ctx, gen_config, callback)
     }
 
     pub fn generate_from_encoding(
-        &mut self,
-        encoding: Encoding,
+        &self,
+        prompt_token_ids: Vec<u32>,
+        ctx: &mut GenerationContext,
         gen_config: GenerationConfig,
         mut callback: StreamCallback,
     ) -> Result<GenerationReport, LociError> 
     {
         // Tokenize prompt
-        let prompt_token_ids = encoding.get_ids();
         let input_tokens_len = prompt_token_ids.len();
         debug!("Input tokens length: {}", input_tokens_len);
 
         // Initialize sampler (handles temperature, top-p, etc.)
         let tool_start_token_id = self.post_sampling_config.tool_call_start_token_id;
-        let mut sampler = InferenceSampler::new(gen_config.clone(), self.vocab_size, 20, tool_start_token_id);
+        let special_token_ids = self.tokenizer.special_token_ids();
+        let mut sampler: Box<dyn Sampler> = Box::new(InferenceSampler::new(gen_config.clone(), special_token_ids, self.vocab_size, 20, tool_start_token_id));
         prompt_token_ids.iter().for_each(|token| sampler.add_token(*token));
 
-        let matched_cache_len = self.match_cache_ctx(prompt_token_ids)?;
+        let matched_cache_len = self.match_ctx_cache(
+            ctx, 
+            &prompt_token_ids,
+        )?;
         let input_tokens = &prompt_token_ids[matched_cache_len..];
         debug!(input_len = input_tokens.len());
         let end_token = self.tokenizer.eos_token_id();
-        let mut stream_ctx = crate::tokenizer::StreamContext::with_capacity(8);
+        let mut stream_ctx = crate::tokenizer::StreamContext::with_capacity(16);
 
         let generation_start = Instant::now();
         let mut reasoning_supervisor = ReasoningSupervisor::new(self.supports_reasoning, &gen_config.reasoning_effort, &self.post_sampling_config);
-        let mut tool_calling_supervisor = ToolCallingSupervisor::new(self.supports_tool_calling, &self.post_sampling_config, &self.tokenizer, &gen_config.tool_choice)
+        let mut tool_calling_supervisor = ToolCallingSupervisor::new(self.supports_tool_calling, &self.post_sampling_config, &self.tokenizer)
             .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
+        let mut tool_choice_template = if let Some(tool_calling_supervisor) = tool_calling_supervisor.as_ref() {
+            tool_calling_supervisor.get_tool_choice_template(&self.tokenizer, &gen_config.tool_choice)
+                .map_err(|e| LociError::Inference { source: e.into_boxed_dyn_error() })?
+        } else {
+            None
+        };
         let reasoning_budget = reasoning_supervisor.as_ref().map_or(0, |rs| rs.reasoning_budget as usize);
 
         let mut handler = GenerationHandler::new(
@@ -237,9 +229,10 @@ impl InferenceEngine {
             reasoning_supervisor, 
             tool_calling_supervisor,
             end_token,
-        );
+            tool_choice_template,
+        ).map_err(|e| LociError::Inference { source: e.into_boxed_dyn_error() })?;
 
-        let mut stop_pattern_matcher = StopPatternMatcher::new(gen_config.stop_tokens, &self.tokenizer);
+        let mut stop_pattern_matcher = StopPatternMatcher::new(gen_config.stop_tokens.clone(), &self.tokenizer);
 
         let mut content_text = String::with_capacity(gen_config.max_tokens);
         let mut reasoning_text = String::with_capacity(reasoning_budget);
@@ -247,100 +240,24 @@ impl InferenceEngine {
         let mut i = 0;
 
         // Autoregressive generation loop
-        'generation:loop {
-            // This handles pre-fill on i=0, and single token generation on i>1
-            let input_tokens = take(&mut handler.input_tokens);
-            let input = Tensor::new(input_tokens.as_slice(), &self.device)
-                .map_err(|e| LociError::Inference{ source: Box::new(e) })?
-                .unsqueeze(0)
-                .map_err(|e| LociError::Inference{ source: Box::new(e) })?;
-            let pos = self.generation_context.token_ids.len();
-            let logits = self.model.forward(&input, &mut self.generation_context.cache, pos, self.flash_attn)
-                .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
-            let squeezed_logits = self.squeeze_logits(logits)
-                .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
-            
-            self.generation_context.token_ids.extend(input_tokens);
-            handler.advance(&squeezed_logits, gen_config.logprobs, gen_config.top_logprobs)
-                .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
-            i += 1;
-
-            for event in handler.take_pending_events() {
-                match event {
-                    GenerationEvent::GenerationStopped => {
-                        break 'generation;
-                    }
-                    GenerationEvent::ContentSampled { sampling_result } => {
-                        if stop_pattern_matcher.matches(sampling_result.token) {
-                            finish_reason = FinishReason::Stop;
-                            handler.soft_stop();
-                        }
-                        if let Some(output) = self.tokenizer.process_token_stream(&mut stream_ctx, sampling_result.token)? {
-                            let logprobs = self.decode_sampling_result(&output, sampling_result);
-                        
-                            callback(StreamFrame {
-                                output: &output,
-                                tool_call_chunk: None,
-                                output_type: GenerationDataType::DirectContent,
-                                logprobs,
-                            })?;
-                            content_text.push_str(&output);
-                        }
-                    }
-                    GenerationEvent::ReasoningSampled { sampling_result } => {
-                        if stop_pattern_matcher.matches(sampling_result.token) {
-                            finish_reason = FinishReason::Stop;
-                            handler.soft_stop();
-                        }
-                        if let Some(output) = self.tokenizer.process_token_stream(&mut stream_ctx, sampling_result.token)? {
-                            let logprobs = self.decode_sampling_result(&output, sampling_result);
-                        
-                            callback(StreamFrame {
-                                output: &output,
-                                tool_call_chunk: None,
-                                output_type: GenerationDataType::Reasoning,
-                                logprobs,
-                            })?;
-                            reasoning_text.push_str(&output);
-                        }    
-                    }
-                    GenerationEvent::ToolCallNameChunk { chunk } => {
-                        callback(StreamFrame {
-                            output: "",
-                            tool_call_chunk: Some(chunk),
-                            output_type: GenerationDataType::ToolCallName,
-                            logprobs: None,
-                        })?;
-                        finish_reason = FinishReason::ToolCalls;
-                    }
-                    GenerationEvent::ToolCallArgumentsChunk { chunk } => {
-                        callback(StreamFrame {
-                            output: "",
-                            tool_call_chunk: Some(chunk),
-                            output_type: GenerationDataType::ToolCallArguments,
-                            logprobs: None,
-                        })?;
-                    }
-                    _ => (),
-                }
-            }
-            
-            // Early exit when max tokens - 1 reached (cause soft_stop will append eos) 
-            if i >= (gen_config.max_tokens - 1) {
-                finish_reason = FinishReason::Length;
-                handler.soft_stop();
+        loop {
+            let should_stop = self.step_generation(
+                &mut handler,
+                ctx,
+                &mut stop_pattern_matcher,
+                &mut stream_ctx,
+                &mut callback,
+                &gen_config,
+                &mut finish_reason,
+                &mut content_text,
+                &mut reasoning_text,
+                &mut i,
+            )?;
+            if should_stop {
+                break;
             }
         }
 
-        if let Some(rest) = self.tokenizer.finalize_stream(&mut stream_ctx)? {
-            callback(StreamFrame {
-                output: &rest,
-                tool_call_chunk: None,
-                output_type: handler.gen_type(),
-                logprobs: None,
-            })?;
-            content_text.push_str(&rest);
-        }
         println!();
 
         let token_generation_sec = generation_start.elapsed().as_secs_f64();
@@ -360,61 +277,129 @@ impl InferenceEngine {
         )
     }
 
-    fn match_cache_ctx(&mut self, prompt_token_ids: &[u32]) -> Result<usize, LociError> {
-        let cache_seq_len_dim = self.model.cache_seq_len_dim();
-        let min_prefill_tokens = self.model.min_prefill_tokens();
-        let cache_len = self.generation_context.token_ids.len();
-        let result = if self.prefix_caching {
-            self.model_cache_manager.match_cache(&self.generation_context, &prompt_token_ids, cache_seq_len_dim, min_prefill_tokens, &self.device)?
-        } else {
-            MatchCacheResult::NoMatch
-        };
-        match result {
-            MatchCacheResult::FullyMatchedActiveCache => {
-                debug!("Matched cache length: {}", cache_len);
-                Ok(cache_len)
-            }
-            MatchCacheResult::PartiallyMatchedActiveCache { matched_cache_length } => {
-                for cache in &mut self.generation_context.cache {
-                    if let Some(MixedCache::KvCache(concat_kv_cache)) = cache {
-                        if concat_kv_cache.k().is_some() && concat_kv_cache.v().is_some() {
-                            let mut k = concat_kv_cache.k_mut().unwrap();
-                            *k = k.narrow(cache_seq_len_dim, 0, matched_cache_length)
-                                .map_err(|e| LociError::CacheLoad(e.to_string()))?;
-                            let mut v = concat_kv_cache.v_mut().unwrap();
-                            *v = v.narrow(cache_seq_len_dim, 0, matched_cache_length)
-                                .map_err(|e| LociError::CacheLoad(e.to_string()))?;
-                        }
-                    } else {
-                        *cache = None;
-                    }
-                }
+    fn step_generation(
+        &self,
+        handler: &mut GenerationHandler,
+        ctx: &mut GenerationContext,
+        stop_pattern_matcher: &mut StopPatternMatcher,
+        stream_ctx: &mut StreamContext,
+        callback: &mut StreamCallback,
+        gen_config: &GenerationConfig,
+        finish_reason: &mut FinishReason,
+        content_text: &mut String,
+        reasoning_text: &mut String,
+        i: &mut usize,
+    ) -> Result<bool, LociError> {
+        let token_span = debug_span!("generate_token");
+        let _token_span_guard = token_span.enter();
+        let input_tokens = take(&mut handler.input_tokens);
+        let input = Tensor::new(input_tokens.as_slice(), &self.device)
+            .map_err(|e| LociError::Inference{ source: Box::new(e) })?
+            .unsqueeze(0)
+            .map_err(|e| LociError::Inference{ source: Box::new(e) })?;
+        let pos = ctx.token_ids.len();
+        let logits = self.model.forward(&input, &mut ctx.active_cache, pos, self.flash_attn)
+            .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
+        let squeezed_logits = self.squeeze_logits(logits)
+            .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
 
-                debug!("Matched cache length: {}", matched_cache_length);
-                self.generation_context.token_ids.truncate(matched_cache_length);
-                Ok(matched_cache_length)
+        ctx.update(input_tokens)?;
+        let event = handler.advance(&squeezed_logits, gen_config.logprobs, gen_config.top_logprobs)
+            .map_err(|e| LociError::Inference{ source: e.into_boxed_dyn_error() })?;
+        *i += 1;
+
+        match event {
+            GenerationEvent::GenerationStopped => {
+                return Ok(true);
             }
-            MatchCacheResult::MatchedInactiveCache { matched_cache_length, cache } => {
-                debug!("Cache loaded from disk");
-                debug!("Matched cache length: {}", matched_cache_length);
-                self.generation_context.token_ids.clear();
-                self.generation_context.token_ids.extend_from_slice(&prompt_token_ids[..matched_cache_length]);
-                self.generation_context.cache = cache;
-                Ok(matched_cache_length)
+            GenerationEvent::ContentSampled { sampling_result } => {
+                if stop_pattern_matcher.matches(sampling_result.token) {
+                    *finish_reason = FinishReason::Stop;
+                    handler.soft_stop();
+                }
+                if let Some(output) = self.tokenizer.process_token_stream(stream_ctx, sampling_result.token)? {
+                    let logprobs = self.decode_sampling_result(&output, sampling_result);
+
+                    callback(StreamFrame {
+                        output: &output,
+                        tool_call_chunk: None,
+                        output_type: GenerationDataType::DirectContent,
+                        logprobs,
+                    })?;
+                    content_text.push_str(&output);
+                }
             }
-            MatchCacheResult::NoMatch => {
-                self.generation_context.token_ids.clear();
-                self.generation_context.cache = self.model.init_cache()
-                    .map_err(|e| LociError::ModelLoad(e.to_string()))?;
-                Ok(0)
-            },
+            GenerationEvent::ReasoningSampled { sampling_result } => {
+                if stop_pattern_matcher.matches(sampling_result.token) {
+                    *finish_reason = FinishReason::Stop;
+                    handler.soft_stop();
+                }
+                if let Some(output) = self.tokenizer.process_token_stream(stream_ctx, sampling_result.token)? {
+                    let logprobs = self.decode_sampling_result(&output, sampling_result);
+
+                    callback(StreamFrame {
+                        output: &output,
+                        tool_call_chunk: None,
+                        output_type: GenerationDataType::Reasoning,
+                        logprobs,
+                    })?;
+                    reasoning_text.push_str(&output);
+                }
+            }
+            GenerationEvent::ToolCallNameChunk { chunk } => {
+                callback(StreamFrame {
+                    output: "",
+                    tool_call_chunk: Some(chunk),
+                    output_type: GenerationDataType::ToolCallName,
+                    logprobs: None,
+                })?;
+                *finish_reason = FinishReason::ToolCalls;
+            }
+            GenerationEvent::ToolCallArgumentsChunk { chunk } => {
+                callback(StreamFrame {
+                    output: "",
+                    tool_call_chunk: Some(chunk),
+                    output_type: GenerationDataType::ToolCallArguments,
+                    logprobs: None,
+                })?;
+            }
+            _ => {}
         }
+
+        if *i >= (gen_config.max_tokens - 1) {
+            *finish_reason = FinishReason::Length;
+            handler.soft_stop();
+        }
+
+        Ok(false)
+    }
+
+    fn match_ctx_cache(&self, ctx: &mut GenerationContext, prompt_token_ids: &[u32]) -> Result<usize, LociError> {
+        let min_prefill_tokens = self.model.min_prefill_tokens();
+        let conv_on_cpu = self.model.conv_on_cpu();
+        let matched_cache_len = ctx.match_cache(prompt_token_ids, min_prefill_tokens, &self.device, conv_on_cpu)?;
+        if matched_cache_len == 0 {
+            let new_cache = self.model.init_cache()
+                .map_err(|e| LociError::ModelLoad(e.to_string()))?;
+            ctx.reset_active_cache(new_cache, true)?;
+        } 
+        Ok(matched_cache_len)
     }
 
     fn squeeze_logits(&self, logits: Tensor) -> anyhow::Result<Tensor> {
         let (_, seq_len, _) = logits.dims3()?;
         let last_token_logits = logits.narrow(1, seq_len - 1, 1)?;
         let squeezed = last_token_logits.squeeze(0)?.squeeze(0)?;
+
+        // let squeezed_vec = squeezed.to_vec1::<f32>()?;
+        // let mut squeezed_hm = squeezed_vec.iter().enumerate()
+        //     .collect::<Vec<(usize, &f32)>>();
+        // squeezed_hm.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // let first_logits = squeezed_hm.iter().take(3)
+        //     .map(|(id, logit)| format!("with id: {}, value: {}: {}", id, self.tokenizer.decode(&[*id as u32], false).unwrap(), logit))
+        //     .collect::<Vec<String>>()
+        //     .join(", ");
+        // debug!("First 3 highest logits: {}", first_logits);
 
         anyhow::Ok(squeezed)
     }
@@ -443,13 +428,5 @@ impl InferenceEngine {
             bytes,
             top_logprobs,
         })
-    }
-
-    pub fn flush_cache_to_file(&mut self) {
-        if !self.prefix_caching { return; }
-        if self.generation_context.token_ids.is_empty() { return; }
-        if let Err(e) = self.model_cache_manager.save_cache(&self.generation_context) {
-            warn!("Failed to flush cache: {e}");
-        }
     }
 }

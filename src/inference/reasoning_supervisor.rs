@@ -1,4 +1,4 @@
-use crate::api::types::ReasoningEffort;
+use crate::types::ReasoningEffort;
 use crate::inference::{PostSamplingConfig, GenerationDataType, GenerationEvent};
 
 const HIGH_REASONING_BUDGET: u32 = 16384;
@@ -13,7 +13,6 @@ pub struct ReasoningSupervisor {
     pub reasoning_end_token_id: u32,
     pub reasoning_start_detected: bool,
     pub reasoning_end_detected: bool,
-    pub pending_events: Vec<GenerationEvent>,
 }
 
 impl ReasoningSupervisor {
@@ -34,18 +33,8 @@ impl ReasoningSupervisor {
             reasoning_tokens: 0,
             reasoning_start_token_id,
             reasoning_end_token_id,
-            pending_events: Vec::with_capacity(4),
             ..Default::default()
         })
-    }
-
-    pub fn take_events(&mut self) -> Vec<GenerationEvent> {
-        std::mem::take(&mut self.pending_events)
-    }
-
-    /// Emit an event to be processed by the handler
-    fn emit_event(&mut self, event: GenerationEvent) {
-        self.pending_events.push(event);
     }
 
     pub fn reasoning_tokens_count(&self) -> u32 {
@@ -60,18 +49,20 @@ impl ReasoningSupervisor {
         token_ids.ends_with(std::slice::from_ref(&self.reasoning_end_token_id))
     }
 
-    pub fn advance(&mut self, token_ids: &[u32], ongoing_gen_type: &GenerationDataType) {
+    pub fn advance(&mut self, token_ids: &[u32], ongoing_gen_type: &GenerationDataType) -> GenerationEvent {
         if ongoing_gen_type == &GenerationDataType::Reasoning { 
             self.reasoning_tokens += token_ids.len() as u32;
             if self.detect_reasoning_end(token_ids) {
-                self.emit_event(GenerationEvent::ReasoningStopped);
+                GenerationEvent::ReasoningStopped
             } else if self.reasoning_budget_exceeded(){
-                self.emit_event(GenerationEvent::ForceTokens { tokens: vec![self.reasoning_end_token_id] });
+                GenerationEvent::ForceTokens { tokens: vec![self.reasoning_end_token_id] }
+            } else {
+                GenerationEvent::None
             }
-        }
-        
-        if self.detect_reasoning_start(token_ids) {
-            self.emit_event(GenerationEvent::ReasoningStarted);
+        } else if self.detect_reasoning_start(token_ids) {
+            GenerationEvent::ReasoningStarted
+        } else {
+            GenerationEvent::None
         }
     }
 

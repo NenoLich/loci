@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::api::types::{ChatMessage, Role};
+use crate::types::{ChatMessage, Role};
 
 pub struct Session {
     pub id: Uuid,

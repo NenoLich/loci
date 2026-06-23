@@ -1,6 +1,9 @@
 use candle_core::{Tensor, Device, DType, Module};
 use candle_transformers::quantized_var_builder::VarBuilder;
 use candle_core::quantized::{GgmlDType, QMatMul};
+use once_cell::sync::OnceCell;
+
+use crate::model::MixedCache;
 
 pub fn repeat_kv(x: Tensor, n_rep: usize) -> anyhow::Result<Tensor> {
     if n_rep == 1 {
@@ -206,5 +209,48 @@ impl RotaryEmbedding {
         rotated.to_dtype(original_dtype).map_err(anyhow::Error::msg)
     }
 
+}
+
+/// Build a causal attention mask for the given sequence length.
+/// Uses a lazily-initialized index tensor cached in `mask_indices`.
+pub fn get_mask(
+    mask_indices: &OnceCell<Tensor>,
+    max_seq_len: usize,
+    seq_len: usize,
+    dtype: DType,
+    device: &Device,
+) -> anyhow::Result<Tensor> {
+    let indices = mask_indices.get_or_try_init(|| {
+        Tensor::arange(0u32, max_seq_len as u32, device)
+    })?;
+    let idx = indices.narrow(0, 0, seq_len)?;
+
+    let i = idx.reshape((seq_len, 1))?.broadcast_as((seq_len, seq_len))?;
+    let j = idx.reshape((1, seq_len))?.broadcast_as((seq_len, seq_len))?;
+    let mask = i.lt(&j)?;
+
+    let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?
+        .to_dtype(dtype)?
+        .broadcast_as((seq_len, seq_len))?;
+    let zeros = Tensor::new(0f32, device)?
+        .to_dtype(dtype)?
+        .broadcast_as((seq_len, seq_len))?;
+
+    Ok(mask.where_cond(&neg_inf, &zeros)?)
+}
+
+/// Append key/value tensors to the KV cache, converting to F16.
+pub fn update_cache(
+    k: Tensor,
+    v: Tensor,
+    cache: &mut Option<MixedCache>,
+) -> anyhow::Result<(Tensor, Tensor)> {
+    match cache {
+        Some(MixedCache::KvCache(kv_cache)) => {
+            kv_cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?)
+                .map_err(anyhow::Error::msg)
+        }
+        _ => Ok((k, v)),
+    }
 }
 

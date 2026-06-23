@@ -12,11 +12,12 @@ use std::sync::Arc;
 use tracing::{info, error, debug};
 use uuid::Uuid;
 
-use crate::inference::{InferenceEngine, StreamCallback, StreamFrame, GenerationDataType, GenerationReport};
+use crate::inference::{InferenceEngine, StreamCallback, StreamFrame, GenerationDataType, GenerationReport, GenerationContext};
 use crate::error::LociError;
 use crate::gguf::GgufInfo;
 use crate::config::{InferenceConfig, GenerationOverrides, ModelCacheConfig};
-use crate::api::types::*;
+use crate::api::types::{ChatCompletionResponse, Choice, ChatCompletionChunk, ChunkDelta, ChunkChoice, ValidatedChatCompletionRequest};
+use crate::types::{Role, FinishReason, ChunkLogprob};
 
 #[derive(Clone)]
 pub struct StaticChatCompletionData {
@@ -37,22 +38,33 @@ pub enum WorkerCommand {
 pub struct EngineWorker {
     inference_config: InferenceConfig,
     model_cache_config: ModelCacheConfig,
-    active_engine: Option<InferenceEngine>,
+    active_engine: Option<Arc<InferenceEngine>>,
+    generation_context: Option<GenerationContext>,
     command_rx: Receiver<WorkerCommand>,
     idle_timeout: Duration,
     cancellation_token: CancellationToken,
 }
 
 impl EngineWorker {
-    pub fn new(inference_config: InferenceConfig, model_cache_config: ModelCacheConfig, active_engine: Option<InferenceEngine>, command_rx: Receiver<WorkerCommand>, idle_timeout: u64, cancellation_token: CancellationToken) -> Self {
-        EngineWorker {
+    pub fn new(inference_config: InferenceConfig, model_cache_config: ModelCacheConfig, engine_option: Option<InferenceEngine>, command_rx: Receiver<WorkerCommand>, idle_timeout: u64, cancellation_token: CancellationToken) -> Result<Self, LociError> {
+        let (active_engine, generation_context) = if let Some(engine) = engine_option {
+            let model_name = engine.model_name();
+            let cache_info = engine.model_cache_info();
+            let ctx = GenerationContext::new(&model_name, Some(model_cache_config.clone()), cache_info)?;
+            (Some(Arc::new(engine)), Some(ctx))
+        } else {
+            (None, None)
+        };
+
+        Ok(EngineWorker {
             inference_config,
             model_cache_config,
             active_engine,
+            generation_context,
             command_rx,
             idle_timeout: Duration::from_secs(idle_timeout),
             cancellation_token,
-        }
+        })
     }
 
     pub async fn run(mut self) {
@@ -66,53 +78,64 @@ impl EngineWorker {
                     match maybe_cmd {
                         Some(WorkerCommand::ChatCompletion { req, response_tx }) => {
                             // 1. Check/Swap the model safely
+                            let (_, req_model_name) = req.model.rsplit_once(&['/', '\\']).unwrap_or(("", &req.model));
                             let current_model_match = self.active_engine.as_ref()
-                                .map(|s| s.model_path() == req.model)
+                                .map(|s| &s.model_name() == req_model_name)
                                 .unwrap_or(false);
 
                             if !current_model_match {
                                 // Load new model (automatically drops old one)
-                                self.drop_engine();
-                                let builder = InferenceEngine::builder()
+                                self.drop_engine_and_ctx();
+                                let engine_builder = InferenceEngine::builder()
                                     .with_gguf_metadata(req.model.clone())
-                                    .inference_config(Some(self.inference_config.clone()))
-                                    .model_cache_config(Some(self.model_cache_config.clone()));
+                                    .inference_config(Some(self.inference_config.clone()));
 
                                 let engine_result = tokio::task::spawn_blocking(move || {
-                                    builder.build()
+                                    engine_builder.build()
                                 }).await.unwrap();
 
                                 match engine_result {
                                     Ok(eng) => {
-                                        self.active_engine = Some(eng);
+                                        self.active_engine = Some(Arc::new(eng));
                                     }
                                     Err(e) => {
                                         let _ = response_tx.send(Err(e.to_string()));
                                         continue;
                                     }
                                 }
+                                if let Some(cache_info) = self.active_engine.as_ref().map(|s| s.model_cache_info()) {
+                                    match GenerationContext::new(req_model_name, Some(self.model_cache_config.clone()), cache_info) {
+                                        Ok(ctx) => {
+                                            self.generation_context = Some(ctx);
+                                        }
+                                        Err(e) => {
+                                            let _ = response_tx.send(Err(e.to_string()));
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
-                            
-                            let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
+
+                            let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(128);
 
                             // Send the receiving end back to the Axum handler immediately
                             let _ = response_tx.send(Ok(stream_rx));
 
-                            if let Some(mut engine) = self.active_engine.take() {
-                                let generation_cancel_token = self.cancellation_token.clone();
-                                // 3. Process the inference synchronously inside this blocking thread.
-                                let returned_engine = tokio::task::spawn_blocking(move || {
-                                    if req.stream.unwrap_or(false) {
-                                        run_stream_generation(&mut engine, req, stream_tx, generation_cancel_token);
-                                    } else {
-                                        // For non-streaming, run generation and send a single event
-                                        run_single_generation(&mut engine, req, stream_tx, generation_cancel_token);
-                                    }
-                                    engine
-                                }).await.unwrap();
+                            let Some(engine) = self.active_engine.clone() else { continue; };
+                            let Some(mut ctx) = self.generation_context.take() else { continue; };
 
-                                self.active_engine = Some(returned_engine);
-                            }
+                            let generation_cancel_token = self.cancellation_token.clone();
+
+                            let returned_ctx = tokio::task::spawn_blocking(move || {
+                                if req.stream.unwrap_or(false) {
+                                    run_stream_generation(&engine, &mut ctx, req, stream_tx, generation_cancel_token);
+                                } else {
+                                    run_single_generation(&engine, &mut ctx, req, stream_tx, generation_cancel_token);
+                                }
+                                ctx
+                            }).await.unwrap();
+
+                            self.generation_context = Some(returned_ctx);
 
                             // Update tracking timestamp
                             last_used = Instant::now();
@@ -129,26 +152,28 @@ impl EngineWorker {
                 _ = sleep(Duration::from_secs(30)) => {
                     if self.active_engine.is_some() && last_used.elapsed() > self.idle_timeout {
                         info!("Engine idle timeout reached. Unloading model.");
-                        self.drop_engine(); // Drops the engine and frees VRAM/RAM
+                        self.drop_engine_and_ctx(); // Drops the engine and frees VRAM/RAM
                     }
                 }
             }
         }
 
-        self.drop_engine();
+        self.drop_engine_and_ctx();
     }
 
-    fn drop_engine(&mut self) {
-        if let Some(engine) = self.active_engine.as_mut() {
-            engine.flush_cache_to_file();
+    fn drop_engine_and_ctx(&mut self) {
+        if let Some(ctx) = self.generation_context.as_mut() {
+            ctx.save_active_cache();
         }
+        self.generation_context = None;
         self.active_engine = None;
     }
 }
 
 
 fn run_stream_generation(
-    engine: &mut InferenceEngine,
+    engine: &InferenceEngine,
+    ctx: &mut GenerationContext,
     req: ValidatedChatCompletionRequest,
     stream_tx: Sender<Result<Event, Infallible>>,
     cancellation_token: CancellationToken,
@@ -167,6 +192,7 @@ fn run_stream_generation(
         None,
     );
 
+    let model_name = engine.model_name();
     // Setup initial chunk
     let static_data = StaticChatCompletionData {
         id: Uuid::new_v4().to_string(),
@@ -174,8 +200,8 @@ fn run_stream_generation(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        model: req.model.clone(),
-        system_fingerprint: format!("loci-{}", req.model),
+        model: model_name.clone(),
+        system_fingerprint: format!("loci-{}", &model_name),
     };
 
     let initial_chunk = build_initial_chunk(static_data.clone());
@@ -216,7 +242,7 @@ fn run_stream_generation(
 
             Ok(())
         });
-    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, callback) {
+    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), ctx, overrides, callback) {
         Ok(report) => {
             debug!("Generation report: {:#?}", report);
             let final_content_chunk = build_final_content_chunk(static_data.clone(), report.finish_reason.clone());
@@ -382,7 +408,8 @@ fn build_usage_chunk(
 }
 
 fn run_single_generation(
-    engine: &mut InferenceEngine,
+    engine: &InferenceEngine,
+    ctx: &mut GenerationContext,
     req: ValidatedChatCompletionRequest,
     stream_tx: Sender<Result<Event, Infallible>>,
     cancellation_token: CancellationToken,
@@ -401,6 +428,7 @@ fn run_single_generation(
         None,
     );
 
+    let model_name = engine.model_name();
     let callback_tx = stream_tx.clone();
     let callback: StreamCallback = Box::new(move |_| {
         if callback_tx.is_closed() {
@@ -413,10 +441,10 @@ fn run_single_generation(
         }
         Ok(())
     });
-    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), overrides, callback) {
+    match engine.generate_chat_stream(&req.messages, &req.tools.unwrap_or_default(), ctx, overrides, callback) {
         Ok(report) => {
             debug!("Generation report: {:#?}", report);
-            let chat_completion_response = build_chat_completion_response(&req.model, report);
+            let chat_completion_response = build_chat_completion_response(&model_name, report);
             if let Ok(response_event) = Event::default().json_data(chat_completion_response) {
                 match stream_tx.try_send(Ok(response_event)) {
                     Err(Full(event)) => {

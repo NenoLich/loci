@@ -1,5 +1,5 @@
 use crate::inference::PostSamplingConfig;
-use crate::tokenizer::{TokenizerService, StreamContext};
+use crate::tokenizer::{Tokenizer, StreamContext};
 use std::mem::take;
 
 #[derive(Debug, Clone)]
@@ -10,22 +10,22 @@ pub enum ToolFormatStyle {
 }
 
 pub trait ToolArgFormatter {
-    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &TokenizerService) -> anyhow::Result<Vec<u32>>;
+    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &dyn Tokenizer) -> anyhow::Result<Vec<u32>>;
     fn try_strip_name_prefix(&self, decoded_buffer: &mut String) -> bool;
-    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>>;
+    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>>;
     fn try_strip_arguments_prefix(&self, decoded_buffer: &mut String) -> bool;
     fn fix_json(&mut self, decoded_buffer: &mut String, first_chunk: bool);
-    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<()>;
+    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<()>;
     fn reset(&mut self);
 }
 
 pub struct ToolArgFormatterBuilder<'a> {
     config: &'a PostSamplingConfig,
-    tokenizer: &'a TokenizerService,
+    tokenizer: &'a dyn Tokenizer,
 }
 
 impl<'a> ToolArgFormatterBuilder<'a> {
-    pub fn new(config: &'a PostSamplingConfig, tokenizer: &'a TokenizerService) -> Self {
+    pub fn new(config: &'a PostSamplingConfig, tokenizer: &'a dyn Tokenizer) -> Self {
         Self { config , tokenizer }
     }
 
@@ -44,10 +44,10 @@ impl<'a> ToolArgFormatterBuilder<'a> {
                 self.config.arg_value_close_token_id.ok_or_else(
                 || anyhow::anyhow!("Missing arg_value_close_token_id for XmlArgPairsFormatter")
                 )?,
-                &self.tokenizer,
+                self.tokenizer,
             )?),
-            ToolFormatStyle::EnclosedJson => Box::new(EnclosedJsonFormatter::new(&self.tokenizer)?),
-            ToolFormatStyle::PythonCall => Box::new(PythonCallFormatter::new(&self.tokenizer)?),
+            ToolFormatStyle::EnclosedJson => Box::new(EnclosedJsonFormatter::new(self.tokenizer)?),
+            ToolFormatStyle::PythonCall => Box::new(PythonCallFormatter::new(self.tokenizer)?),
         })
     }
 }
@@ -60,7 +60,7 @@ pub struct XmlArgPairsFormatter {
     json_arg_start: String,
     json_arg_key_close: String,
     json_arg_value_wrapper: String,
-    json_arg_delimeter: String,
+    json_arg_delimiter: String,
 }
 
 impl XmlArgPairsFormatter {
@@ -69,12 +69,12 @@ impl XmlArgPairsFormatter {
         arg_key_close_token_id: u32,
         arg_value_open_token_id: u32,
         arg_value_close_token_id: u32,
-        tokenizer: &TokenizerService
+        tokenizer: &dyn Tokenizer
     ) -> anyhow::Result<Self> {
         let json_arg_start = r#"{""#.to_string();
         let json_arg_key_close = r#"": "#.to_string();
         let json_arg_value_wrapper = r#"""#.to_string();
-        let json_arg_delimeter = r#", ""#.to_string();
+        let json_arg_delimiter = r#", ""#.to_string();
         Ok(Self {
             arg_key_open_token_id,
             arg_key_close_token_id,
@@ -83,18 +83,18 @@ impl XmlArgPairsFormatter {
             json_arg_start,
             json_arg_key_close,
             json_arg_value_wrapper,
-            json_arg_delimeter,
+            json_arg_delimiter,
         })
     }
 }
 
 impl ToolArgFormatter for XmlArgPairsFormatter {
-    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &TokenizerService) -> anyhow::Result<Vec<u32>> {
+    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &dyn Tokenizer) -> anyhow::Result<Vec<u32>> {
         if let Some(name) = tool_name {
-            let encoding = tokenizer.encode(name, false)?;
-            let mut result = Vec::with_capacity(encoding.len() + 1);
+            let ids = tokenizer.encode(name, false)?;
+            let mut result = Vec::with_capacity(ids.len() + 1);
             result.push(*tool_call_start_token_id);
-            result.extend_from_slice(encoding.get_ids());
+            result.extend_from_slice(&ids);
             return Ok(result);
         } 
         
@@ -105,7 +105,7 @@ impl ToolArgFormatter for XmlArgPairsFormatter {
         true
     }
 
-    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>> {
+    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>> {
         let mut name_and_remainder = token_ids.rsplitn(2, |item| item == &self.arg_key_open_token_id);
         let name_piece = name_and_remainder.next().unwrap();
         let remainder_option = name_and_remainder.next();
@@ -152,11 +152,11 @@ impl ToolArgFormatter for XmlArgPairsFormatter {
             decoded_buffer.insert_str(0, r#"{{""#);
         }
     }
-    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<()> {
+    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<()> {
         for id in token_ids {
             match *id {
                 token_id if token_id == self.arg_key_open_token_id => {
-                    decoded_buffer.push_str(&self.json_arg_delimeter);
+                    decoded_buffer.push_str(&self.json_arg_delimiter);
                 }
                 token_id if token_id == self.arg_key_close_token_id => {
                     decoded_buffer.push_str(&self.json_arg_key_close);
@@ -191,7 +191,7 @@ pub struct EnclosedJsonFormatter {
 }
 
 impl EnclosedJsonFormatter {
-    fn new(tokenizer: &TokenizerService) -> anyhow::Result<Self> {
+    fn new(tokenizer: &dyn Tokenizer) -> anyhow::Result<Self> {
         let name_prefix = r#"{"name": ""#.to_string();
         let name_suffix = r#"""#.to_string();
         let arguments_prefix = r#""arguments":"#.to_string();
@@ -206,8 +206,8 @@ impl EnclosedJsonFormatter {
 }
 
 impl ToolArgFormatter for EnclosedJsonFormatter {
-    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &TokenizerService) -> anyhow::Result<Vec<u32>> {
-        let encoding = if let Some(name) = tool_name {
+    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &dyn Tokenizer) -> anyhow::Result<Vec<u32>> {
+        let ids = if let Some(name) = tool_name {
             let template = format!(r#"{{"name":"{}""#, name);
             tokenizer.encode(&template, false)?     
         } else {
@@ -215,10 +215,9 @@ impl ToolArgFormatter for EnclosedJsonFormatter {
             tokenizer.encode(template, false)?
         };
 
-        let mut result = Vec::with_capacity(encoding.len() + 1);
-        let tool_name_ids = encoding.get_ids();
+        let mut result = Vec::with_capacity(ids.len() + 1);
         result.push(*tool_call_start_token_id);
-        result.extend_from_slice(tool_name_ids);
+        result.extend_from_slice(&ids);
         Ok(result)
     }
     
@@ -239,7 +238,7 @@ impl ToolArgFormatter for EnclosedJsonFormatter {
         }
     }
 
-    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>> {
+    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>> {
         if let Some(decoded_piece) = tokenizer.process_multiple_token_stream(stream_ctx, token_ids)? {
             match decoded_piece.rsplit_once(&self.name_suffix) {
                 Some((name_piece, "")) => {
@@ -316,7 +315,7 @@ impl ToolArgFormatter for EnclosedJsonFormatter {
             });
     }
 
-    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<()> {
+    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<()> {
         if let Some(decoded_piece) = tokenizer.process_multiple_token_stream(stream_ctx, token_ids)? {
             decoded_buffer.push_str(&decoded_piece);
         }
@@ -340,7 +339,7 @@ pub struct PythonCallFormatter {
 }
 
 impl PythonCallFormatter {
-    fn new(tokenizer: &TokenizerService) -> anyhow::Result<Self> {
+    fn new(tokenizer: &dyn Tokenizer) -> anyhow::Result<Self> {
         let name_suffix = r#"("#.to_string();
     
         Ok(Self {
@@ -351,12 +350,12 @@ impl PythonCallFormatter {
 }
 
 impl ToolArgFormatter for PythonCallFormatter {
-    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &TokenizerService) -> anyhow::Result<Vec<u32>> {
+    fn build_tool_call_template(&self, tool_call_start_token_id: &u32, tool_name: Option<&str>, tokenizer: &dyn Tokenizer) -> anyhow::Result<Vec<u32>> {
         if let Some(name) = tool_name {
-            let encoding = tokenizer.encode(&format!("[{}", name), false)?;
-            let mut result = Vec::with_capacity(encoding.len() + 1);
+            let ids = tokenizer.encode(&format!("[{}", name), false)?;
+            let mut result = Vec::with_capacity(ids.len() + 1);
             result.push(*tool_call_start_token_id);
-            result.extend_from_slice(encoding.get_ids());
+            result.extend_from_slice(&ids);
             return Ok(result);
         } 
         
@@ -367,7 +366,7 @@ impl ToolArgFormatter for PythonCallFormatter {
         true
     }
 
-    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>> {
+    fn try_extract_function_name(&self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<Option<String>> {
         if let Some(decoded_piece) = tokenizer.process_multiple_token_stream(stream_ctx, token_ids)? {
             match decoded_piece.rsplit_once(&self.name_suffix) {
                 Some((name_piece, "")) => {
@@ -476,7 +475,7 @@ impl ToolArgFormatter for PythonCallFormatter {
         decoded_buffer.push_str(&output);
     }
 
-    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &TokenizerService, stream_ctx: &mut StreamContext) -> anyhow::Result<()> {
+    fn format_args(&mut self, token_ids: &[u32], decoded_buffer: &mut String, tokenizer: &dyn Tokenizer, stream_ctx: &mut StreamContext) -> anyhow::Result<()> {
         if let Some(decoded_piece) = tokenizer.process_multiple_token_stream(stream_ctx, token_ids)? {
             decoded_buffer.push_str(&decoded_piece);
         }

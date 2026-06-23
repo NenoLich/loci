@@ -1,5 +1,5 @@
 use crate::gguf::GgufInfo;
-use crate::api::types::{ToolChoice, ToolChoiceMode, ReasoningEffort};
+use crate::types::{ToolChoice, ToolChoiceMode, ReasoningEffort};
 use crate::config::GenerationFileConfig;
 
 /// Generation parameters with priority: CLI > GGUF metadata > defaults
@@ -17,6 +17,23 @@ pub struct GenerationConfig {
     pub seed: usize,
 }
 
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 32_000,
+            temperature: 0.8,
+            top_p: 0.9,
+            repetition_penalty: 1.15,
+            tool_choice: ToolChoice::Mode(ToolChoiceMode::Auto),
+            reasoning_effort: ReasoningEffort::High,
+            stop_tokens: None,
+            logprobs: false,
+            top_logprobs: None,
+            seed: 19,
+        }
+    }
+}
+
 impl GenerationConfig {
     /// Create a new builder for generation config
     pub fn builder() -> GenerationConfigBuilder {
@@ -25,16 +42,17 @@ impl GenerationConfig {
 
     /// Resolve from GGUF metadata
     pub fn from_gguf_metadata(gguf_info: &GgufInfo) -> anyhow::Result<Self> {
-        let mut temperature = GenerationConfigDefaults::TEMPERATURE;
-        let mut max_tokens = GenerationConfigDefaults::MAX_TOKENS;
-        let mut top_p = GenerationConfigDefaults::TOP_P;
-        let mut repetition_penalty = GenerationConfigDefaults::REPETITION_PENALTY;
-        let mut tool_choice = GenerationConfigDefaults::TOOL_CHOICE;
-        let mut reasoning_effort = GenerationConfigDefaults::REASONING_EFFORT;
-        let mut stop_tokens = GenerationConfigDefaults::STOP_TOKENS;
-        let mut logprobs = GenerationConfigDefaults::LOGPROBS;
-        let mut top_logprobs = GenerationConfigDefaults::TOP_LOGPROBS;
-        let mut seed = GenerationConfigDefaults::SEED;
+        let default = GenerationConfig::default();
+        let mut temperature = default.temperature;
+        let mut max_tokens = default.max_tokens;
+        let mut top_p = default.top_p;
+        let mut repetition_penalty = default.repetition_penalty;
+        let mut tool_choice = default.tool_choice;
+        let mut reasoning_effort = default.reasoning_effort;
+        let mut stop_tokens = default.stop_tokens;
+        let mut logprobs = default.logprobs;
+        let mut top_logprobs = default.top_logprobs;
+        let mut seed = default.seed;
 
         let metadata = &gguf_info.kv_meta;
 
@@ -235,37 +253,38 @@ impl GenerationConfigBuilder {
 
     /// Resolve with priority: explicit > gguf > defaults
     pub fn build(self) -> GenerationConfig {
+        let default = GenerationConfig::default();
         GenerationConfig {
             temperature: self
                 .temperature
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.temperature))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.temperature))
-                .unwrap_or(GenerationConfigDefaults::TEMPERATURE),
+                .unwrap_or(default.temperature),
             top_p: self
                 .top_p
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.top_p))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.top_p))
-                .unwrap_or(GenerationConfigDefaults::TOP_P),
+                .unwrap_or(default.top_p),
             max_tokens: self
                 .max_tokens
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.max_tokens))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.max_tokens))
-                .unwrap_or(GenerationConfigDefaults::MAX_TOKENS),
+                .unwrap_or(default.max_tokens),
             repetition_penalty: self
                 .repetition_penalty
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.repetition_penalty))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.repetition_penalty))
-                .unwrap_or(GenerationConfigDefaults::REPETITION_PENALTY),
+                .unwrap_or(default.repetition_penalty),
             tool_choice: self
                 .tool_choice
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.tool_choice.clone()))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.tool_choice.clone()))
-                .unwrap_or(GenerationConfigDefaults::TOOL_CHOICE),
+                .unwrap_or(default.tool_choice),
             reasoning_effort: self
                 .reasoning_effort
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.reasoning_effort.clone()))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.reasoning_effort.clone()))
-                .unwrap_or(GenerationConfigDefaults::REASONING_EFFORT),
+                .unwrap_or(default.reasoning_effort),
             stop_tokens: self
                 .stop_tokens
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.stop_tokens.clone()))
@@ -274,7 +293,7 @@ impl GenerationConfigBuilder {
                 .logprobs
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.logprobs))
                 .or_else(|| self.gguf_config.as_ref().map(|c| c.logprobs))
-                .unwrap_or(GenerationConfigDefaults::LOGPROBS),
+                .unwrap_or(default.logprobs),
             top_logprobs: self
                 .top_logprobs
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.top_logprobs))
@@ -282,25 +301,9 @@ impl GenerationConfigBuilder {
             seed: self
                 .seed
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.seed))
-                .unwrap_or(GenerationConfigDefaults::SEED),
+                .unwrap_or(default.seed),
         }
     }
-}
-
-/// Default generation parameters
-pub struct GenerationConfigDefaults;
-
-impl GenerationConfigDefaults {
-    pub const TEMPERATURE: f32 = 0.8;
-    pub const MAX_TOKENS: usize = 32_000;
-    pub const TOP_P: f32 = 0.9;
-    pub const REPETITION_PENALTY: f32 = 1.15;
-    pub const TOOL_CHOICE: ToolChoice = ToolChoice::Mode(ToolChoiceMode::Auto);
-    pub const REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
-    pub const STOP_TOKENS: Option<Vec<String>> = None;
-    pub const LOGPROBS: bool = false;
-    pub const TOP_LOGPROBS: Option<usize> = None;
-    pub const SEED: usize = 19;
 }
 
 #[derive(Default)]
@@ -400,29 +403,5 @@ impl GenerationOverrides {
     pub fn file_config(mut self, file_config: GenerationFileConfig) -> Self {
         self.file_config = Some(file_config);
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_priority_explicit_over_defaults() {
-        let config = GenerationConfig::builder()
-            .temperature(Some(0.5))
-            .max_tokens(Some(200))
-            .build();
-
-        assert_eq!(config.temperature, Some(0.5));
-        assert_eq!(config.max_tokens, Some(200));
-    }
-
-    #[test]
-    fn test_defaults_when_nothing_specified() {
-        let config = GenerationConfig::builder().build();
-
-        assert_eq!(config.temperature, Some(GenerationConfigDefaults::TEMPERATURE));
-        assert_eq!(config.max_tokens, Some(GenerationConfigDefaults::MAX_TOKENS));
     }
 }

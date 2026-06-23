@@ -38,7 +38,8 @@ tokio-util = { version = "0.7.13", features = ["rt"] }
 toml = "1.1.2"
 tower-http = { version = "0.6.10", features = ["cors", "trace"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-flame = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "registry"] }
 uuid = { version = "1.23.1", features = ["v4", "fast-rng"] }
 
 [features]

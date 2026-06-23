@@ -7,16 +7,18 @@ use candle_nn::{
     Conv1d, Conv1dConfig, Module,
     ops::{silu, softmax},
 };
-use nvtx::{range, range_push, range_pop};
+use tracing::trace_span;
+use nvtx::{range_push, range_pop};
 use candle_transformers::quantized_nn::{RmsNorm, Embedding};
 use candle_transformers::quantized_var_builder::VarBuilder;
 use once_cell::sync::OnceCell;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
-use crate::model::utility::{repeat_kv, get_tensor, find_norm_prefix, qmatmul_forward, RotaryEmbedding};
+use crate::model::utility::{repeat_kv, get_tensor, find_norm_prefix, qmatmul_forward, get_mask, update_cache, RotaryEmbedding};
 use crate::{
-    model::{Model, MixedCache},
+    model::{Model, MixedCache, ModelCacheType},
+    error::LociError,
     config::ModelConfig,
 };
 
@@ -40,6 +42,12 @@ pub struct Lfm2Model {
     pub cache_seq_len_dim: usize,
     /// Minimum input tokens needed for conv cache init (max conv_l_cache - 1 across layers)
     pub min_prefill_tokens: usize,
+    /// Whether to run convolutions on CPU
+    pub conv_on_cpu: bool,
+    /// Maximum kernel size across all conv layers (used as cache block size lower bound)
+    pub max_kernel_size: usize,
+    /// Length of active convolution cache
+    pub conv_l_cache: usize,
 }
 
 /// A single transformer layer in the LFM2 model.
@@ -179,7 +187,7 @@ impl AttentionMixer {
         let k = self.k_norm.forward(&k.to_dtype(DType::F32)?)?;
 
         // 4. Update KV cache and compute attention
-        let (k, v) = self.update_cache(k, v, cache)?;
+        let (k, v) = update_cache(k, v, cache)?;
 
         range_push!("Compute attn");
         let y = self.compute_attention(q, k, v, compute_dtype, use_flash)?;
@@ -212,20 +220,6 @@ impl AttentionMixer {
     }
 
     /// Update KV cache with new keys and values.
-    fn update_cache(
-        &self,
-        k: Tensor,
-        v: Tensor,
-        cache: &mut Option<MixedCache>,
-    ) -> anyhow::Result<(Tensor, Tensor)> {
-        match cache {
-            Some(MixedCache::KvCache(kv_cache)) => {
-                kv_cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?).map_err(anyhow::Error::msg)
-            }
-            _ => Ok((k, v)),
-        }
-    }
-
     /// Compute attention scores and apply attention weights to values.
     ///
     /// Uses either flash attention (on CUDA) or standard grouped-query attention.
@@ -293,7 +287,7 @@ impl AttentionMixer {
 
         // Apply causal mask for sequences longer than 1 token
         let attn = if seq_len > 1 {
-            let mask = self.get_mask(seq_len, compute_dtype, q.device())?;
+            let mask = get_mask(&self.mask_indices, self.max_seq_len, seq_len, compute_dtype, q.device())?;
             let attn = attn.to_dtype(compute_dtype)?;
             attn.broadcast_add(&mask)?.to_dtype(DType::F32)?
         } else {
@@ -308,34 +302,6 @@ impl AttentionMixer {
         Ok(y_t.to_dtype(compute_dtype)?.transpose(1, 2)?)
     }
 
-    /// Get or create the causal attention mask for the given sequence length.
-    fn get_mask(
-        &self,
-        seq_len: usize,
-        dtype: DType,
-        device: &Device,
-    ) -> anyhow::Result<Tensor> {
-        // Lazily initialize the mask indices
-        let indices = self.mask_indices.get_or_try_init(|| {
-            Tensor::arange(0u32, self.max_seq_len as u32, device)
-        })?;
-        let idx = indices.narrow(0, 0, seq_len)?;
-
-        // Create causal mask: positions i < j should be masked
-        let i = idx.reshape((seq_len, 1))?.broadcast_as((seq_len, seq_len))?;
-        let j = idx.reshape((1, seq_len))?.broadcast_as((seq_len, seq_len))?;
-        let mask = i.lt(&j)?;
-
-        // Apply mask: masked positions get -inf, others get 0
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?
-            .to_dtype(dtype)?
-            .broadcast_as((seq_len, seq_len))?;
-        let zeros = Tensor::new(0f32, device)?
-            .to_dtype(dtype)?
-            .broadcast_as((seq_len, seq_len))?;
-
-        Ok(mask.where_cond(&neg_inf, &zeros)?)
-    }
 }
 
 /// Short convolution mixer with gating mechanism.
@@ -411,7 +377,7 @@ impl ShortConvMixer {
         seq_len: usize,
         hidden_size: usize,
     ) -> anyhow::Result<Tensor> {
-        let _range = range!("Conv forward (cache and forward)");
+        range_push!("Conv forward (cache and forward)");
 
         // Optionally move to CPU for convolution
         let original_device = input.device().clone();
@@ -434,6 +400,7 @@ impl ShortConvMixer {
         } else {
             conv_out
         };
+        range_pop!();
         Ok(output)
     }
 
@@ -466,9 +433,10 @@ impl ShortConvMixer {
         hidden_size: usize,
         pad_len: usize,
     ) -> anyhow::Result<Tensor> {
+        let original_dtype = input.dtype();
         if let Some(MixedCache::ConvCache(state)) = cache {
             // Clone the state tensor to use it
-            let state_tensor = state.clone();
+            let state_tensor = state.clone().to_dtype(original_dtype)?;
             // Concatenate cached state with new input
             let input_cached = Tensor::cat(&[&state_tensor, input], 2)?;
             let current_len = input_cached.dims()[2];
@@ -479,7 +447,7 @@ impl ShortConvMixer {
                 current_len - (self.conv_l_cache - 1),
                 self.conv_l_cache - 1,
             )?;
-            *cache = Some(MixedCache::ConvCache(new_cache));
+            *cache = Some(MixedCache::ConvCache(new_cache.to_dtype(DType::F16)?));
 
             // Use the last kernel_size tokens for convolution
             Ok(input_cached.narrow(2, current_len - self.kernel_size, self.kernel_size)?)
@@ -490,7 +458,9 @@ impl ShortConvMixer {
                 input.dtype(),
                 input.device(),
             )?;
-            Ok(Tensor::cat(&[pad, input.clone()], 2)?)
+            *cache = Some(MixedCache::ConvCache(input.clone().to_dtype(DType::F16)?));
+
+            Ok(Tensor::cat(&[&pad, input], 2)?)
         }
     }
 
@@ -504,20 +474,29 @@ impl ShortConvMixer {
         hidden_size: usize,
         pad_len: usize,
     ) -> anyhow::Result<Tensor> {
-        // Pad left to maintain causal convolution
-        let pad = Tensor::zeros(
-            (batch_size, hidden_size, pad_len),
-            input.dtype(),
-            input.device(),
-        )?;
+        let original_dtype = input.dtype();
+        Ok(if let Some(MixedCache::ConvCache(state)) = cache {
+            // Concatenate cached state with new input
+            let state_tensor = state.clone().to_dtype(original_dtype)?;
+            let input_cached = Tensor::cat(&[&state_tensor, input], 2)?;
+            let current_len = input_cached.dims()[2];
+            let output_len = seq_len + pad_len;
 
-        // Update cache with the last pad_len tokens for future decode steps
-        if seq_len >= pad_len {
-            let new_cache = input.narrow(2, seq_len - (self.conv_l_cache - 1), self.conv_l_cache - 1)?;
-            *cache = Some(MixedCache::ConvCache(new_cache));
-        }
+            *cache = Some(MixedCache::ConvCache(input_cached.clone().to_dtype(DType::F16)?));
 
-        Ok(Tensor::cat(&[pad, input.clone()], 2)?)
+            input_cached.narrow(2, current_len - output_len, output_len)?
+        } else {
+            // Pad left to maintain causal convolution
+            let pad = Tensor::zeros(
+                (batch_size, hidden_size, pad_len),
+                input.dtype(),
+                input.device(),
+            )?;
+            let padded_input = Tensor::cat(&[&pad, input], 2)?;
+            *cache = Some(MixedCache::ConvCache(input.clone().to_dtype(DType::F16)?));
+
+            padded_input
+        })
     }
 }
 
@@ -589,13 +568,14 @@ impl Model for Lfm2Model {
         // 2. Transformer layers
         range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(
+            let layer_span = trace_span!("layer", layer = i);
+            x = layer_span.in_scope(|| layer.forward(
                 &x,
                 cache.get_mut(i).unwrap(),
                 pos,
                 self.compute_dtype,
                 use_flash,
-            )?;
+            ))?;
         }
         range_pop!();
 
@@ -629,7 +609,24 @@ impl Model for Lfm2Model {
     }
 
     fn min_prefill_tokens(&self) -> usize {
-        self.min_prefill_tokens
+        // self.min_prefill_tokens
+        1
+    }
+
+    fn conv_on_cpu(&self) -> bool {
+        self.conv_on_cpu
+    }
+
+    fn cache_block_size_hint(&self) -> usize {
+        self.max_kernel_size
+    }
+
+    fn model_cache_type(&self) -> ModelCacheType {
+        ModelCacheType::MixedWithConv { conv_l_cache: self.conv_l_cache - 1 }
+    }
+
+    fn n_layers(&self) -> usize {
+        self.layers.len()
     }
 }
 
@@ -652,7 +649,7 @@ impl Lfm2Model {
         requested_max_seq_len: usize,
         conv_on_cpu: bool,
     ) -> anyhow::Result<Self> {
-        let _range = range!("Lfm2Model loading");
+        range_push!("Lfm2Model loading");
 
         let rms_epsilon = config.rms_epsilon as f64;
         let hidden_size = config.hidden_size;
@@ -708,6 +705,15 @@ impl Lfm2Model {
 
         // Find minimum prefill tokens for conv layers (each conv needs kernel_size-1 context)
         let min_prefill_tokens = config.conv_l_cache.map(|c| c.saturating_sub(1)).unwrap_or(1);
+        // Compute maximum kernel size across all conv layers for cache block size hint
+        let max_kernel_size = layers.iter()
+            .filter_map(|layer| match &layer.mixer {
+                Lfm2Mixer::ShortConv(conv) => Some(conv.kernel_size),
+                Lfm2Mixer::Attention(_) => None,
+            })
+            .max()
+            .unwrap_or(1);
+        range_pop!();
 
         Ok(Self {
             embed_layer,
@@ -717,6 +723,9 @@ impl Lfm2Model {
             compute_dtype,
             cache_seq_len_dim: config.cache_seq_len_dim,
             min_prefill_tokens,
+            conv_on_cpu,
+            max_kernel_size,
+            conv_l_cache: config.conv_l_cache.unwrap_or(3),
         })
     }
 

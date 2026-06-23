@@ -1,5 +1,5 @@
 use crate::inference::{SamplingResult, ToolFormatStyle};
-use crate::api::types::{ChunkToolCall, LogprobsContent, ChatMessage, FinishReason, Usage, ToolCall, Role, CompletionTokensDetails};
+use crate::types::{ChunkToolCall, LogprobsContent, ChatMessage, FinishReason, Usage, ToolCall, Role, CompletionTokensDetails};
 use crate::error::LociError;
 use crate::model::MixedCache;
 
@@ -10,10 +10,12 @@ pub type StreamCallback = Box<dyn for<'a> FnMut(StreamFrame<'a>) -> Result<(), L
 /// Events emitted by supervisors during token processing
 #[derive(Clone, Debug)]
 pub enum GenerationEvent {
+    /// No event
+    None,
     /// Tool call generation started
     ToolCallStarted,
     /// Tool call generation stopped
-    ToolCallStopped,
+    ToolCallStopped { chunk: Option<ChunkToolCall>},
     /// Reasoning generation started
     ReasoningStarted,
     /// Reasoning generation stopped
@@ -38,22 +40,6 @@ pub enum GenerationDataType {
     Reasoning,
     ToolCallName,
     ToolCallArguments,
-}
-
-pub struct GenerationContext {
-    pub model_name: String,
-    pub token_ids: Vec<u32>,
-    pub cache: Vec<Option<MixedCache>>,
-}
-
-impl GenerationContext {
-    pub fn new(model_name: &str) -> Self {
-        Self {
-            model_name: model_name.to_string(),
-            token_ids: Vec::new(),
-            cache: Vec::new(),
-        }
-    }
 }
 
 pub struct StreamFrame<'a> {
@@ -87,7 +73,7 @@ impl GenerationReport {
         let chat_message = match (tool_calls_option, reasoning_option) {
             (None, None) => ChatMessage::new(Role::Assistant, content_text),
             (None, Some(reasoning)) => ChatMessage::with_reasoning_content(Role::Assistant, content_text, reasoning),
-            (Some(tools), reasoning) => ChatMessage::with_tool_calls(Role::Assistant, tools, reasoning),
+            (Some(tools), reasoning) => ChatMessage::with_tool_calls(Role::Assistant, content_text, tools, reasoning),
         };
         let usage = Usage {
             prompt_tokens,

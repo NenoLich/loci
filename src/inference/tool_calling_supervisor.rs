@@ -1,6 +1,6 @@
-use crate::api::types::{ToolCall, ChunkToolCall, ChunkFunctionCall, FunctionDefinition, ToolChoice, ToolChoiceMode, SpecificToolChoice};
+use crate::types::{ToolCall, ChunkToolCall, ChunkFunctionCall, FunctionDefinition, ToolChoice, ToolChoiceMode, SpecificToolChoice};
 use crate::inference::{ToolArgFormatter, ToolArgFormatterBuilder, PostSamplingConfig, GenerationDataType, GenerationEvent};
-use crate::tokenizer::{TokenizerService, StreamContext};
+use crate::tokenizer::{Tokenizer, StreamContext};
 use uuid::Uuid;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -61,7 +61,7 @@ impl ToolCallParsingState for NamePrefixState {
 pub struct NameContentState;
 impl ToolCallParsingState for NameContentState {
     fn next_state(&self, context: &mut ToolCallingSupervisorContext) -> anyhow::Result<StateEnum> {
-        let tool_name_option = context.formatter.try_extract_function_name(&context.current_ids_buffer, &mut context.decoded_scratchpad, &context.tokenizer, &mut context.stream_ctx)?;
+        let tool_name_option = context.formatter.try_extract_function_name(&context.current_ids_buffer, &mut context.decoded_scratchpad, context.tokenizer, &mut context.stream_ctx)?;
         context.current_ids_buffer.clear();
         match tool_name_option {
             Some(tool_name) => {
@@ -106,7 +106,7 @@ impl ToolCallParsingState for ArgumentsContentState {
 
 pub struct ToolCallingSupervisorContext<'a> {
     pub formatter: Box<dyn ToolArgFormatter>,
-    pub tokenizer: &'a TokenizerService,
+    pub tokenizer: &'a dyn Tokenizer,
     pub stream_ctx: StreamContext,                      // Streaming context for tool arguments
     pub tool_call_start_token_id: u32,
     pub tool_call_end_token_id: u32,
@@ -125,7 +125,7 @@ impl<'a> ToolCallingSupervisorContext<'a> {
         self.current_tool_name.retain(|c| c.is_alphanumeric() || c == '_');
     }
     fn format_and_decode_args(&mut self) -> anyhow::Result<()> {
-        self.formatter.format_args(&self.current_ids_buffer, &mut self.decoded_scratchpad, &self.tokenizer, &mut self.stream_ctx)?;
+        self.formatter.format_args(&self.current_ids_buffer, &mut self.decoded_scratchpad, self.tokenizer, &mut self.stream_ctx)?;
         self.current_ids_buffer.clear();
         Ok(())
     }
@@ -141,11 +141,10 @@ impl<'a> ToolCallingSupervisorContext<'a> {
 pub struct ToolCallingSupervisor<'a> {
     pub context: ToolCallingSupervisorContext<'a>,
     pub tool_call_parsing_state: StateEnum,
-    pending_events: Vec<GenerationEvent>,
 }
 
 impl<'a> ToolCallingSupervisor<'a> {
-    pub fn new(supports_tool_calling: bool, config: &PostSamplingConfig, tokenizer: &'a TokenizerService, tool_choice: &ToolChoice) -> anyhow::Result<Option<Self>> {
+    pub fn new(supports_tool_calling: bool, config: &PostSamplingConfig, tokenizer: &'a dyn Tokenizer) -> anyhow::Result<Option<Self>> {
         if !supports_tool_calling {
             return Ok(None);
         }
@@ -161,20 +160,8 @@ impl<'a> ToolCallingSupervisor<'a> {
         let Some(tool_call_end_token_id) = config.tool_call_end_token_id.clone() else {
             return Ok(None);
         };
-
-        let mut pending_events = Vec::with_capacity(4);
-        if *tool_choice == ToolChoice::Mode(ToolChoiceMode::Required) { 
-            pending_events.push(GenerationEvent::ForceTokens { 
-                tokens: formatter.build_tool_call_template(&tool_call_start_token_id, None, tokenizer)? 
-            });
-        } else if let ToolChoice::Specific(SpecificToolChoice { function, .. }) = tool_choice {
-            pending_events.push(GenerationEvent::ForceTokens { 
-                tokens: formatter.build_tool_call_template(&tool_call_start_token_id, Some(&function.name), tokenizer)? 
-            });
-        };
-        
-        
-        let stream_ctx = StreamContext::with_capacity(50);
+            
+        let stream_ctx = StreamContext::with_capacity(16);
 
         let context = ToolCallingSupervisorContext {
             formatter,
@@ -194,18 +181,19 @@ impl<'a> ToolCallingSupervisor<'a> {
         Ok(Some(ToolCallingSupervisor {
             context,
             tool_call_parsing_state: StateEnum::None,
-            pending_events,
         }))
     }
 
-    /// Retrieve all pending events emitted during token processing
-    pub fn take_events(&mut self) -> Vec<GenerationEvent> {
-        std::mem::take(&mut self.pending_events)
-    }
-
-    /// Emit an event to be processed by the handler
-    fn emit_event(&mut self, event: GenerationEvent) {
-        self.pending_events.push(event);
+    pub fn get_tool_choice_template(&self, tokenizer: &'a dyn Tokenizer, tool_choice: &ToolChoice) -> anyhow::Result<Option<Vec<u32>>> {
+        match tool_choice {
+            ToolChoice::Mode(ToolChoiceMode::Required) => {
+                Ok(Some(self.context.formatter.build_tool_call_template(&self.context.tool_call_start_token_id, None, tokenizer)?))
+            },
+            ToolChoice::Specific(SpecificToolChoice { function, .. }) => {
+                Ok(Some(self.context.formatter.build_tool_call_template(&self.context.tool_call_start_token_id, Some(&function.name), tokenizer)?))
+            },
+            _ => Ok(None),
+        }
     }
 
     pub fn tool_calls(&self) -> Option<Vec<ToolCall>> {
@@ -220,8 +208,8 @@ impl<'a> ToolCallingSupervisor<'a> {
         self.context.current_ids_buffer.ends_with(std::slice::from_ref(&self.context.tool_call_end_token_id))
     }
 
-    pub fn finalize_tool_call(&mut self, ongoing_gen_type: &GenerationDataType) -> anyhow::Result<()> {
-        match ongoing_gen_type {
+    pub fn finalize_tool_call(&mut self, ongoing_gen_type: &GenerationDataType) -> anyhow::Result<Option<ChunkToolCall>> {
+        let chunk =match ongoing_gen_type {
             GenerationDataType::ToolCallName => {
                 if self.context.current_tool_name.is_empty() {
                     // Corrected: Explicitly cast end sequence vector to a slice view reference
@@ -240,7 +228,7 @@ impl<'a> ToolCallingSupervisor<'a> {
                     self.context.current_tool_id = Uuid::new_v4().to_string();
                 }
                 self.context.current_ids_buffer.clear();
-                self.emit_initial_tool_call_chunk();
+                Some(self.emit_initial_tool_call_chunk())
             },
             
             GenerationDataType::ToolCallArguments => {
@@ -266,12 +254,11 @@ impl<'a> ToolCallingSupervisor<'a> {
                 if !current_args.is_empty() && !current_args.ends_with('}') {
                     self.context.current_tool_arguments.push('}');
                 }
-                self.emit_arg_tool_call_chunk();
+                self.emit_arg_tool_call_chunk()
             }
-            _ => return Ok(()),
-        }
+            _ => None,
+        };
 
-        // Safely parse into your strongly-typed struct contracts
         let json_arguments: HashMap<String, Value> = serde_json::from_str(&self.context.current_tool_arguments)
             .map_err(|e| anyhow::anyhow!(
                 "Failed to parse model tool arguments into JSON. Raw String: '{}'. Error: {}", 
@@ -289,7 +276,7 @@ impl<'a> ToolCallingSupervisor<'a> {
         
         self.context.tool_calls.push(tool_call.clone());
 
-        Ok(())
+        Ok(chunk)
     }
 
     pub fn reset(&mut self) {
@@ -302,47 +289,57 @@ impl<'a> ToolCallingSupervisor<'a> {
         self.tool_call_parsing_state = StateEnum::None;
         // Reset the streaming context for next tool call
         self.context.stream_ctx.reset();
-        // Clear pending events on reset
-        self.pending_events.clear();
     }
 
-    pub fn advance(&mut self, token_ids: &[u32], ongoing_gen_type: &GenerationDataType) -> anyhow::Result<()> {
+    pub fn advance(&mut self, token_ids: &[u32], ongoing_gen_type: &GenerationDataType) -> anyhow::Result<GenerationEvent> {
         Ok(match ongoing_gen_type {
             GenerationDataType::DirectContent => {
                 if self.detect_tool_call_start(token_ids) {
-                    self.emit_event(GenerationEvent::ToolCallStarted);
+                    GenerationEvent::ToolCallStarted
+                } else {
+                    GenerationEvent::None
                 }
             }
             GenerationDataType::ToolCallName | GenerationDataType::ToolCallArguments => {
                 self.context.current_ids_buffer.extend_from_slice(token_ids);
                 if self.detect_tool_call_end() {
-                    self.emit_event(GenerationEvent::ToolCallStopped);
-                    self.finalize_tool_call(ongoing_gen_type)?;
+                    let chunk = self.finalize_tool_call(ongoing_gen_type)?;
                     self.reset();
+                    GenerationEvent::ToolCallStopped { chunk }
                 } else {
                     self.tool_call_parsing_state = self.tool_call_parsing_state.next_state(&mut self.context)?;
-                    self.emit_tool_call_chunk(ongoing_gen_type);
+                    if let Some(event) = self.emit_tool_call_chunk_event(ongoing_gen_type) {
+                        event
+                    } else {
+                        GenerationEvent::None
+                    }
                 }
             }
-            _ => (),
+            _ => GenerationEvent::None,
         })
     }
 
-    pub fn emit_tool_call_chunk(&mut self, ongoing_gen_type: &GenerationDataType) {
+    pub fn emit_tool_call_chunk_event(&mut self, ongoing_gen_type: &GenerationDataType) -> Option<GenerationEvent> {
         match ongoing_gen_type {
             GenerationDataType::ToolCallName => {
                 if !self.context.current_tool_name.is_empty() {
-                    self.emit_initial_tool_call_chunk();
+                    Some(GenerationEvent::ToolCallNameChunk { chunk: self.emit_initial_tool_call_chunk() })
+                } else {
+                    None
                 }
             }
             GenerationDataType::ToolCallArguments => {
-                self.emit_arg_tool_call_chunk();
+                if let Some(chunk) = self.emit_arg_tool_call_chunk() {
+                    Some(GenerationEvent::ToolCallArgumentsChunk { chunk })
+                } else {
+                    None  
+                }
             }
-            _ => (),
+            _ => None,
         }
     }
 
-    pub fn emit_initial_tool_call_chunk(&mut self) { 
+    pub fn emit_initial_tool_call_chunk(&mut self) -> ChunkToolCall { 
         let id = Some(if self.context.current_tool_id.is_empty() {
             let new_id = Uuid::new_v4();
             self.context.current_tool_id = new_id.to_string();
@@ -350,7 +347,8 @@ impl<'a> ToolCallingSupervisor<'a> {
         } else {
             self.context.current_tool_id.clone()
         });
-        let chunk = ChunkToolCall {
+
+        ChunkToolCall {
             index: 0,
             id,
             r#type: Some("function".to_string()),
@@ -358,18 +356,16 @@ impl<'a> ToolCallingSupervisor<'a> {
                 name: Some(self.context.current_tool_name.clone()),
                 arguments: String::new(),
             },
-        };
-
-        self.emit_event(GenerationEvent::ToolCallNameChunk { chunk });
+        }
     }
 
-    pub fn emit_arg_tool_call_chunk(&mut self) {
+    pub fn emit_arg_tool_call_chunk(&mut self) -> Option<ChunkToolCall> {
         if self.context.current_tool_arguments.is_empty() || self.context.stream_args_pos >= self.context.current_tool_arguments.len() {
-            return;
+            return None;
         }
         let arguments = self.context.current_tool_arguments[self.context.stream_args_pos..].to_string();
         self.context.stream_args_pos = self.context.current_tool_arguments.len();
-        let chunk = ChunkToolCall {
+        Some(ChunkToolCall {
             index: 0,
             id: None,
             r#type: None,
@@ -377,9 +373,7 @@ impl<'a> ToolCallingSupervisor<'a> {
                 name: None,
                 arguments,
             },
-        };
-
-        self.emit_event(GenerationEvent::ToolCallArgumentsChunk { chunk });
+        })
 
     }
 }

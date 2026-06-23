@@ -11,6 +11,7 @@ use std::path::Path;
 pub struct Loader;
 
 impl Loader {
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn load_gguf_info(
         path: impl AsRef<Path>,
         first_k_tensors: usize,
@@ -173,7 +174,10 @@ impl Loader {
             if !matches!(entry.value.as_slice(), Some(array) if array.len() > 16) {
                 println!("{}: {} = {}", entry.key, entry.value_type, entry.value);
             } else {
-                println!("{}: {} = [MORE THEN 16 ENTRIES]", entry.key, entry.value_type);
+                // Added '&' before entry.value to borrow it as a slice reference
+                let slice = entry.value.as_slice().unwrap();
+                let limit = 16.min(slice.len());
+                println!("{}: {} = {:?}...[MORE THAN 16 ENTRIES]", entry.key, entry.value_type, &slice[0..limit]);
             }
         }
         println!("─────────────────────────────────");

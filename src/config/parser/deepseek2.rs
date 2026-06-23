@@ -4,6 +4,7 @@ use std::str::FromStr;
 use crate::gguf::{GgufInfo, GgufKVMeta, GgufValue};
 use crate::config::{ModelConfig, ModelArchitecture}; 
 use crate::inference::ToolFormatStyle;
+use crate::config::parser::build_n_kv_count;
 
 pub struct DeepSeek2ExtraParameters;
 
@@ -64,7 +65,7 @@ impl Deepseek2Parser {
                 "deepseek2.embedding_length" => hidden_size = entry.value.as_usize(),
                 "deepseek2.feed_forward_length" => intermediate_ffn_size = entry.value.as_usize(),
                 "deepseek2.attention.head_count" => n_heads = entry.value.as_usize(),
-                "deepseek2.attention.head_count_kv" => n_kv_heads = Some(Self::build_n_kv_count(entry)?),
+                "deepseek2.attention.head_count_kv" => n_kv_heads = Some(build_n_kv_count(entry)?),
                 "deepseek2.rope.freq_base" => rope_theta = entry.value.as_f32(),
                 "deepseek2.attention.layer_norm_rms_epsilon" => {
                     if let Some(value) = entry.value.as_f32() {
@@ -120,7 +121,7 @@ impl Deepseek2Parser {
         Ok(ModelConfig {
             file_path: PathBuf::from_str(gguf_info.headers.path.as_str())?,
             architecture,
-            model_name: model_name.ok_or_else(|| anyhow::anyhow!("Missing general.name"))?,
+            model_name: model_name.ok_or_else(|| anyhow::anyhow!("Missing general.name"))?.to_string(),
             hidden_size: hidden_size.ok_or_else(|| anyhow::anyhow!("Missing embedding_length"))?,
             n_heads,
             n_kv_heads,
@@ -163,25 +164,5 @@ impl Deepseek2Parser {
             arg_value_open_token_id: DeepSeek2ExtraParameters::ARG_VALUE_OPEN_TOKEN_ID,
             arg_value_close_token_id: DeepSeek2ExtraParameters::ARG_VALUE_CLOSE_TOKEN_ID,
         })
-    }
-
-    fn build_n_kv_count(gguf_meta_entry: &GgufKVMeta) -> anyhow::Result<Vec<usize>> {
-        let result = match &gguf_meta_entry.value {
-            GgufValue::Array(v) => v
-                .iter()
-                .map(|f| {
-                    f.as_usize()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid KV head entry"))
-                })
-                .collect::<anyhow::Result<Vec<usize>>>()?,
-            _ => vec![
-                gguf_meta_entry
-                    .value
-                    .as_usize()
-                    .ok_or_else(|| anyhow::anyhow!("Expected usize for KV count"))?,
-            ],
-        };
-
-        Ok(result)
     }
 }

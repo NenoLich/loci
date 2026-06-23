@@ -7,19 +7,32 @@ mod tokenizer;
 mod inference;
 mod session;
 mod api;
+mod types;
+mod render;
 
 use tokio;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("debug"))
-        )
-        .with_writer(std::io::stderr)
+    let fmt_layer = fmt::layer().with_writer(std::io::stderr);
+
+    let enable_flame = std::env::var("LOCI_FLAMEGRAPH").map(|v| v == "true").unwrap_or(false);
+    let (flame_layer, _guard) = if enable_flame {
+        let flame_path = std::env::var("LOCI_FLAMEGRAPH_PATH")
+            .unwrap_or_else(|_| ".profile/tracing.folded".to_string());
+        let (flame_layer, _guard) = tracing_flame::FlameLayer::with_file(&flame_path)?;
+        (Some(flame_layer), Some(_guard))
+    } else {
+        (None, None)
+    };
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with(fmt_layer)
+        .with(flame_layer)
         .init();
-        
+
     cli::run().await
 }

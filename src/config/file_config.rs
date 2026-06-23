@@ -2,7 +2,7 @@ use serde::{Deserialize};
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
-use crate::api::types::{ToolChoice, ReasoningEffort};
+use crate::types::{ToolChoice, ReasoningEffort, ModelCacheFragmentation};
 use crate::error::LociError;
 
 #[derive(Debug, Copy, Clone, clap::ValueEnum, Deserialize)]
@@ -59,12 +59,13 @@ pub struct InferenceFileConfig {
     pub max_seq_len: Option<usize>,
     pub conv_on_cpu: Option<bool>,
     pub flash_attn: Option<bool>,
-    pub prefix_caching: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheFileConfig {
+    pub prefix_caching: Option<bool>,
     pub cache_dir: Option<String>,
     pub max_cache_size: Option<u64>,
     pub min_cache_tokens: Option<usize>,
+    pub fragmentation: Option<ModelCacheFragmentation>,
 }

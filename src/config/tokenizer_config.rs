@@ -4,7 +4,7 @@ pub struct TokenizerConfig {
     pub model_type: Option<String>, // from tokenizer.ggml.model
     pub pre_tokenizer_tag: Option<String>,
     pub tokens: Option<Vec<String>>,
-    pub token_type: Option<Vec<u32>>,
+    pub token_type: Option<Vec<i32>>,
     pub merges: Option<Vec<String>>,
     pub json_config: Option<String>,
     pub chat_template: Option<String>,
@@ -38,14 +38,14 @@ impl From<&[GgufKVMeta]> for TokenizerConfig {
 
         for kv_meta in metadata {
             match kv_meta.key.as_str() {
-                "tokenizer.ggml.hf_json" => json_config = kv_meta.value.as_string(),
-                "tokenizer.ggml.model" => model_type = kv_meta.value.as_string(),
-                "tokenizer.ggml.pre" => pre_tokenizer_tag = kv_meta.value.as_string(),
+                "tokenizer.ggml.hf_json" => json_config = kv_meta.value.as_string().map(|v| v.to_string()),
+                "tokenizer.ggml.model" => model_type = kv_meta.value.as_string().map(|v| v.to_string()),
+                "tokenizer.ggml.pre" => pre_tokenizer_tag = kv_meta.value.as_string().map(|v| v.to_string()),
                 "tokenizer.ggml.tokens" => {
                     tokens = kv_meta.value.as_slice().and_then(|slice| {
                         slice
                             .iter()
-                            .filter_map(|v: &GgufValue| v.as_string().map(Some))
+                            .filter_map(|v: &GgufValue| v.as_string().map(|v| Some(v.to_string())))
                             .collect::<Option<Vec<String>>>()
                     })
                 }
@@ -53,19 +53,19 @@ impl From<&[GgufKVMeta]> for TokenizerConfig {
                     token_type = kv_meta.value.as_slice().and_then(|slice| {
                         slice
                             .iter()
-                            .filter_map(|v: &GgufValue| v.as_u32().map(Some))
-                            .collect::<Option<Vec<u32>>>()
+                            .filter_map(|v: &GgufValue| v.as_i32().map(Some))
+                            .collect::<Option<Vec<i32>>>()
                     })
                 }
                 "tokenizer.ggml.merges" => {
                     merges = kv_meta.value.as_slice().and_then(|slice| {
                         slice
                             .iter()
-                            .filter_map(|v: &GgufValue| v.as_string().map(Some))
+                            .filter_map(|v: &GgufValue| v.as_string().map(|v| Some(v.to_string())))
                             .collect::<Option<Vec<String>>>()
                     })
                 }
-                "tokenizer.chat_template" => chat_template = kv_meta.value.as_string(),
+                "tokenizer.chat_template" => chat_template = kv_meta.value.as_string().map(|v| v.to_string()),
                 "tokenizer.ggml.bos_token_id" => bos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.eos_token_id" => eos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.padding_token_id" => padding_token_id = kv_meta.value.as_u32(),

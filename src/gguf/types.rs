@@ -184,6 +184,17 @@ impl GgufValue {
         }
     }
 
+        pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            GgufValue::Uint8(v) => Some(i32::from(*v)),
+            GgufValue::Uint16(v) => Some(i32::from(*v)),
+            GgufValue::Int8(v) => Some(i32::from(*v)),
+            GgufValue::Int16(v) => Some(i32::from(*v)),
+            GgufValue::Int32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             GgufValue::Uint8(v) => Some(i64::from(*v)),
@@ -202,9 +213,9 @@ impl GgufValue {
         }
     }
 
-    pub fn as_string(&self) -> Option<String> {
+    pub fn as_string(&self) -> Option<&str> {
         if let GgufValue::String(v) = self {
-            Some(v.to_owned())
+            Some(v)
         } else {
             None
         }

@@ -1,28 +1,24 @@
 use ahash::AHashMap;
 
 use tokenizers::pre_tokenizers::sequence::Sequence;
-use std::io;
-use std::io::{Write, ErrorKind, Error};
-use std::collections::{BTreeSet};
+use std::collections::BTreeSet;
 use regex::Regex;
 use serde_json::ser::Formatter;
 
 use crate::error::LociError;
 use crate::gguf::{GgufInfo, GgufKVMeta};
-use crate::api::types::*;
+use crate::types::*;
 use crate::config::TokenizerConfig;
 
-use tokenizers::Encoding;
+use std::io;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::{byte_level::ByteLevel, PreTokenizerWrapper, split::Split};
 use tokenizers::processors::template::TemplateProcessing;
-use tokenizers::{AddedToken, Tokenizer};
+use tokenizers::{AddedToken, Tokenizer as RawTokenizer};
 use once_cell::sync::OnceCell;
 use minijinja::{Environment, context};
 use tracing::debug;
-
-use tempfile::NamedTempFile;
 
 pub struct TokenizerDefaults;
 
@@ -40,7 +36,9 @@ impl TokenizerDefaults {
 /// Accumulates tokens until a complete UTF-8 sequence is decodable, then clears.
 #[derive(Debug)]
 pub struct StreamContext {
-    pending_tokens: Vec<u32>,
+    pub ids: Vec<u32>,
+    pub prefix: String,
+    pub prefix_index: usize,
 }
 
 impl StreamContext {
@@ -48,13 +46,17 @@ impl StreamContext {
     /// Typical token buffering is 1-3 tokens before UTF-8 boundary, so capacity of 8 is safe.
     pub fn with_capacity(capacity: usize) -> Self {
         StreamContext {
-            pending_tokens: Vec::with_capacity(capacity),
+            ids: Vec::with_capacity(capacity),
+            prefix: String::with_capacity(capacity),
+            prefix_index: 0,
         }
     }
 
     /// Reset the streaming context by clearing all pending tokens.
     pub fn reset(&mut self) {
-        self.pending_tokens.clear();
+        self.ids.clear();
+        self.prefix.clear();
+        self.prefix_index = 0;
     }
 }
 
@@ -98,8 +100,18 @@ impl Formatter for SpacedFormatter {
 }
 
 
+pub trait Tokenizer {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, LociError>;
+    fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String, LociError>;
+    fn eos_token_id(&self) -> u32;
+    fn process_token_stream(&self, ctx: &mut StreamContext, token: u32) -> Result<Option<String>, LociError>;
+    fn process_multiple_token_stream(&self, ctx: &mut StreamContext, tokens: &[u32]) -> Result<Option<String>, LociError>;
+    fn apply_chat_template(&self, messages: &[ChatMessage], raw_tools: &[Tool], enable_thinking: bool, flatten_tools_to_functions: bool) -> Result<String, LociError>;
+    fn special_token_ids(&self) -> Vec<u32>;
+}
+
 pub struct TokenizerService {
-    tokenizer: Tokenizer,
+    tokenizer: RawTokenizer,
     chat_template: String,
     bos_token_id: u32,
     eos_token_id: u32,
@@ -111,84 +123,95 @@ pub struct TokenizerService {
     eom_token: OnceCell<String>,
 }
 
-impl TokenizerService {
-    pub fn builder() -> TokenizerServiceBuilder {
-        TokenizerServiceBuilder::new()
-    }
-
-    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Encoding, LociError> {
-        self
-            .tokenizer
+impl Tokenizer for TokenizerService {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, LociError> {
+        self.tokenizer
             .encode(text, add_special_tokens)
+            .map(|enc| enc.get_ids().to_vec())
             .map_err(|e| LociError::Tokenization { source: e })
     }
 
-    pub fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String, LociError> {
+    fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String, LociError> {
         self.tokenizer
             .decode(tokens, skip_special_tokens)
             .map_err(|e| LociError::Tokenization { source: e })
     }
 
-    pub fn eos_token_id(&self) -> u32 {
+    fn eos_token_id(&self) -> u32 {
         self.eos_token_id
     }
 
-    /// Process a single token and accumulate it in the stream context.
-    /// Returns decoded text once a complete UTF-8 boundary is reached.
-    /// Caller owns the StreamContext - no allocation overhead.
-    pub fn process_token_stream(
+    fn special_token_ids(&self) -> Vec<u32> {
+        self.tokenizer.get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter_map(|(id, token)| token.special.then(|| *id))
+            .collect::<Vec<u32>>()
+    }
+
+    fn process_token_stream(
         &self,
         ctx: &mut StreamContext,
         token: u32,
     ) -> Result<Option<String>, LociError> {
-        ctx.pending_tokens.push(token);
-        let text = self.decode(&ctx.pending_tokens, true)?;
+        if ctx.prefix.is_empty() && !ctx.ids.is_empty() {
+            let new_prefix = self.decode(ctx.ids.as_slice(), true)?;
+            if !new_prefix.ends_with('�') {
+                ctx.prefix = new_prefix;
+                ctx.prefix_index = ctx.ids.len();
+            }
+        }
 
-        // Check if we have a complete decodable string (no incomplete UTF-8 replacement char)
-        if !text.ends_with('\u{FFFD}') {
-            ctx.pending_tokens.clear();
-            Ok(Some(text))
+        ctx.ids.push(token);
+        let text = self.decode(ctx.ids.as_slice(), true)?;
+        if text.len() > ctx.prefix.len() && !text.ends_with('�') {
+            if !(text.starts_with(&ctx.prefix)) {
+                return Err(LociError::Tokenization { source: "Invalid prefix in stream context".into() });
+            }
+
+            let new_text = &text[ctx.prefix.len()..].to_string();
+            let new_prefix_index = ctx.ids.len() - ctx.prefix_index;
+            ctx.ids = ctx.ids.drain(ctx.prefix_index..).collect();
+            ctx.prefix = self.decode(ctx.ids.as_slice(), true)?;
+            ctx.prefix_index = new_prefix_index;
+            Ok(Some(new_text.to_string()))
         } else {
             Ok(None)
         }
     }
 
-    /// Process multiple tokens and accumulate them in the stream context.
-    /// Returns decoded text once a complete UTF-8 boundary is reached.
-    pub fn process_multiple_token_stream(
+    fn process_multiple_token_stream(
         &self,
         ctx: &mut StreamContext,
         tokens: &[u32],
     ) -> Result<Option<String>, LociError> {
-        ctx.pending_tokens.extend_from_slice(tokens);
-        let text = self.decode(&ctx.pending_tokens, true)?;
+        if ctx.prefix.is_empty() && !ctx.ids.is_empty() {
+            let new_prefix = self.decode(ctx.ids.as_slice(), true)?;
+            if !new_prefix.ends_with('�') {
+                ctx.prefix = new_prefix;
+                ctx.prefix_index = ctx.ids.len();
+            }
+        }
 
-        if !text.ends_with('\u{FFFD}') {
-            ctx.pending_tokens.clear();
-            Ok(Some(text))
+        ctx.ids.extend_from_slice(tokens);
+        let text = self.decode(ctx.ids.as_slice(), true)?;
+        if text.len() > ctx.prefix.len() && !text.ends_with('�') {
+            if !(text.starts_with(&ctx.prefix)) {
+                return Err(LociError::Tokenization { source: "Invalid prefix in stream context".into() });
+            }
+
+            let new_text = &text[ctx.prefix.len()..].to_string();
+            let new_prefix_index = ctx.ids.len() - ctx.prefix_index;
+            ctx.ids = ctx.ids.drain(ctx.prefix_index..).collect();
+            ctx.prefix = self.decode(ctx.ids.as_slice(), true)?;
+            ctx.prefix_index = new_prefix_index;
+            Ok(Some(new_text.to_string()))
         } else {
             Ok(None)
         }
     }
 
-    /// Finalize the stream and retrieve any remaining decoded text.
-    /// Clears the context after retrieval.
-    pub fn finalize_stream(&self, ctx: &mut StreamContext) -> Result<Option<String>, LociError> {
-        if ctx.pending_tokens.is_empty() {
-            return Ok(None);
-        }
-
-        let text = self.decode(&ctx.pending_tokens, true)?;
-        ctx.pending_tokens.clear();
-
-        if !text.is_empty() && !text.ends_with('\u{FFFD}') {
-            Ok(Some(text))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn apply_chat_template(&self, messages: &[ChatMessage], raw_tools: &[Tool], enable_thinking: bool, flatten_tools_to_functions: bool) -> Result<String, LociError> {
+    fn apply_chat_template(&self, messages: &[ChatMessage], raw_tools: &[Tool], enable_thinking: bool, flatten_tools_to_functions: bool) -> Result<String, LociError> {
         let mut env = Environment::new();
         let name = "chat";
         env.add_template(name, &self.chat_template)
@@ -236,6 +259,42 @@ impl TokenizerService {
     }
 }
 
+impl Tokenizer for Box<dyn Tokenizer + Send + Sync + '_> {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, LociError> {
+        (**self).encode(text, add_special_tokens)
+    }
+
+    fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String, LociError> {
+        (**self).decode(tokens, skip_special_tokens)
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        (**self).eos_token_id()
+    }
+
+    fn process_token_stream(&self, ctx: &mut StreamContext, token: u32) -> Result<Option<String>, LociError> {
+        (**self).process_token_stream(ctx, token)
+    }
+
+    fn process_multiple_token_stream(&self, ctx: &mut StreamContext, tokens: &[u32]) -> Result<Option<String>, LociError> {
+        (**self).process_multiple_token_stream(ctx, tokens)
+    }
+
+    fn apply_chat_template(&self, messages: &[ChatMessage], raw_tools: &[Tool], enable_thinking: bool, flatten_tools_to_functions: bool) -> Result<String, LociError> {
+        (**self).apply_chat_template(messages, raw_tools, enable_thinking, flatten_tools_to_functions)
+    }
+
+    fn special_token_ids(&self) -> Vec<u32> {
+        (**self).special_token_ids()
+    }
+}
+
+impl TokenizerService {
+    pub fn builder() -> TokenizerServiceBuilder {
+        TokenizerServiceBuilder::new()
+    }
+}
+
 fn to_spaced_string<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Error> {
     let mut buf = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(&mut buf, SpacedFormatter);
@@ -250,10 +309,17 @@ pub struct TokenizerServiceBuilder {
     eot_token_id: u32,
     eom_token_id: u32,
     config: Option<TokenizerConfig>,
+    python_get_pattern: Option<Regex>,
+    tojson_kwarg_re: Option<Regex>,
 }
 
 impl TokenizerServiceBuilder {
     pub fn new() -> Self {
+        // Matches .get('key') or .get("key") including variations in spacing
+        let python_get_pattern = Regex::new("\\.get\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)").ok();
+        // Matches ensure_ascii kwarg in tojson() calls (e.g., tojson(x, ensure_ascii=False))
+        let tojson_kwarg_re = Regex::new(r"(?:,\s*)?ensure_ascii\s*=\s*(?:True|False)(?:\s*,)?").ok();
+
         Self {
             chat_template: TokenizerDefaults::CHAT_TEMPLATE.into(),
             bos_token_id: TokenizerDefaults::BOS_TOKEN_ID,
@@ -261,6 +327,8 @@ impl TokenizerServiceBuilder {
             eot_token_id: TokenizerDefaults::EOT_TOKEN_ID,
             eom_token_id: TokenizerDefaults::EOM_TOKEN_ID,
             config: None,
+            python_get_pattern,
+            tojson_kwarg_re,
         }
     }
 
@@ -270,6 +338,7 @@ impl TokenizerServiceBuilder {
         self
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn build(&mut self) -> Result<TokenizerService, LociError> {
         if self.config.is_none() {
             return Err(LociError::TokenizerBuild {
@@ -284,7 +353,7 @@ impl TokenizerServiceBuilder {
             });
         }
 
-        let cleaned_template = Self::clean_chat_template(config.chat_template.as_deref());
+        let cleaned_template = self.clean_chat_template(config.chat_template.as_deref());
         if let Some(ct) = cleaned_template { self.chat_template = ct; }
         if let Some(id) = config.bos_token_id { self.bos_token_id = id; }
         if let Some(id) = config.eos_token_id { self.eos_token_id = id; }
@@ -308,24 +377,18 @@ impl TokenizerServiceBuilder {
             bos_token: OnceCell::new(),
             eos_token: OnceCell::new(),
             eot_token: OnceCell::new(),
-            eom_token: OnceCell::new(),
+            eom_token: OnceCell::new(),   
         })
     }
 
-    fn tokenizer_from_json_key(&self, json_config: &str) -> Result<Tokenizer, LociError> {
-        let mut file = NamedTempFile::new().map_err(|e| LociError::TokenizerBuild {
-            reason: format!("failed to create temp file for tokenizer config: {}", e),
-        })?;
-        write!(file, "{}", json_config).map_err(|e| LociError::TokenizerBuild {
-            reason: format!("failed to write tokenizer config to temp file: {}", e),
-        })?;
-        Tokenizer::from_file(file.path())
+    fn tokenizer_from_json_key(&self, json_config: &str) -> Result<RawTokenizer, LociError> {
+        RawTokenizer::from_bytes(json_config.as_bytes())
             .map_err(|e| LociError::TokenizerBuild {
-                reason: format!("failed to load tokenizer from json config: {}", e),
+                reason: format!("failed to load tokenizer from json config string: {}", e),
             })
     }
 
-    fn tokenizer_from_config(&self, config: &TokenizerConfig) -> Result<Tokenizer, LociError> {
+    fn tokenizer_from_config(&self, config: &TokenizerConfig) -> Result<RawTokenizer, LociError> {
         match config.model_type.as_deref() {
             Some("gpt2") => self.build_bpe_tokenizer(config),
             Some(other) => Err(LociError::TokenizerBuild {
@@ -337,7 +400,7 @@ impl TokenizerServiceBuilder {
         }
     }
 
-    fn build_bpe_tokenizer(&self, config: &TokenizerConfig) -> Result<Tokenizer, LociError> {
+    fn build_bpe_tokenizer(&self, config: &TokenizerConfig) -> Result<RawTokenizer, LociError> {
         let tokens = config.tokens.as_ref().ok_or_else(|| {
             LociError::TokenizerBuild {
                 reason: "tokens are required to build tokenizer but were not found".into(),
@@ -374,7 +437,7 @@ impl TokenizerServiceBuilder {
                 reason: format!("failed to build BPE model: {}", e),
             })?;
 
-        let mut tokenizer = Tokenizer::new(model);
+        let mut tokenizer = RawTokenizer::new(model);
         let pre_wrapper = self.configure_pre_tokenizer(&config.pre_tokenizer_tag)?;
 
         tokenizer.with_pre_tokenizer(Some(pre_wrapper));
@@ -438,14 +501,14 @@ impl TokenizerServiceBuilder {
 
     fn configure_special_tokens(
         &self,
-        tokenizer: &Tokenizer,
+        tokenizer: &RawTokenizer,
         config: &TokenizerConfig,
     ) -> Result<BTreeSet<u32>, LociError> {
         let mut special_ids = BTreeSet::new();
 
         if let Some(types) = &config.token_type {
             for (i, &token_type) in types.iter().enumerate() {
-                if token_type == 4 {
+                if token_type == 4 || token_type == 3 {
                     special_ids.insert(i as u32);
                 }
             }
@@ -471,7 +534,7 @@ impl TokenizerServiceBuilder {
 
     fn set_post_processor(
         &self, 
-        tokenizer: &mut Tokenizer,
+        tokenizer: &mut RawTokenizer,
         config: &TokenizerConfig,
         special_tokens: Vec<(String, u32)>
     ) -> Result<(), LociError> {
@@ -517,7 +580,7 @@ impl TokenizerServiceBuilder {
         Ok(())
     }
 
-    fn clean_chat_template(template: Option<&str>) -> Option<String> {
+    fn clean_chat_template(&self, template: Option<&str>) -> Option<String> {
         if template.is_none() {
             return None;
         }
@@ -583,7 +646,9 @@ impl TokenizerServiceBuilder {
                         // MiniJinja throws a TemplateNotFound or UnknownMethodErrorKind dynamically.
                         let err_msg = err.to_string();
                         if err_msg.contains("no method named get") || err.kind() == minijinja::ErrorKind::UnknownMethod {
-                            return Self::fix_python_code(template);
+                            return self.fix_python_code(template);
+                        } else if err_msg.contains("unknown keyword argument") {
+                            return self.fix_tojson_kwargs(template);
                         } else {
                             debug!("Template validation failed with error: {}", err_msg);
                             return None;
@@ -596,15 +661,26 @@ impl TokenizerServiceBuilder {
         None
     }
 
-    fn fix_python_code(template: &str) -> Option<String> {
-        // Matches .get('key') or .get("key") including variations in spacing
-        let pattern = match Regex::new("\\.get\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)") {
-            Ok(reg) => reg,
-            Err(_) => return Some(template.to_string()),
-        };
-        
+    fn fix_python_code(&self, template: &str) -> Option<String> {
         // Converts .get('tool_calls') into ['tool_calls']
-        let fixed = pattern.replace_all(template, "[$1$2$1]").into_owned();
-        Some(fixed)
+        Some(if let Some(ref pattern) = self.python_get_pattern {
+            pattern.replace_all(template, "[$1$2$1]").into_owned()
+        } else {
+            template.to_string()
+        })
+    }
+
+    fn fix_tojson_kwargs(&self, template: &str) -> Option<String> {
+        // Removes unsupported keyword arguments like ensure_ascii from tojson() calls
+        Some(if let Some(ref pattern) = self.tojson_kwarg_re {
+            let result = pattern.replace_all(template, "").into_owned();
+            // Clean up any artifacts from kwarg removal
+            let result = result.replace(", ,", ",");
+            let result = result.replace("(, ", "(");
+            let result = result.replace(", )", ")");
+            result
+        } else {
+            template.to_string()
+        })
     }
 }

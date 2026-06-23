@@ -1,4 +1,4 @@
-use crate::tokenizer::TokenizerService;
+use crate::tokenizer::Tokenizer;
 
 pub struct StopPattern {
     pattern: Vec<u32>,
@@ -58,11 +58,11 @@ pub struct StopPatternMatcher {
 }
 
 impl StopPatternMatcher {
-    pub fn new(patterns: Option<Vec<String>>, tokenizer: &TokenizerService) -> Self {
+    pub fn new(patterns: Option<Vec<String>>, tokenizer: &dyn Tokenizer) -> Self {
         let patterns = patterns.map(|list| {
             list.iter()
                 .filter_map(|s| tokenizer.encode(s, false).ok())
-                .map(|enc| StopPattern::new(enc.get_ids().to_vec()))
+                .map(|ids| StopPattern::new(ids))
                 .collect()
         });
 

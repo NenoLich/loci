@@ -89,7 +89,7 @@ impl ModelConfig {
             .and_then(|m| m.value.as_string())
             .ok_or_else(|| anyhow::anyhow!("Missing general.architecture"))?;
 
-        let arch = ModelArchitecture::from_str(&arch_str)?;
+        let arch = ModelArchitecture::from_str(arch_str)?;
 
         match arch {
             ModelArchitecture::Lfm2 => Lfm2Parser::parse(gguf_info),
