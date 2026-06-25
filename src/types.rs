@@ -1,13 +1,8 @@
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Value, json};
-use axum::extract::{FromRequest, Request};
-use axum::response::{Response, IntoResponse};
-use axum::http::StatusCode;
-use axum::Json;
+use serde_json::Value;
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Display, Formatter};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -35,7 +30,7 @@ pub struct ChatMessage {
     #[serde(serialize_with = "serialize_option_string")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>, 
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,7 +58,12 @@ impl ChatMessage {
         }
     }
 
-    pub fn with_tool_calls(role: Role, content: &str, tool_calls: Vec<ToolCall>, reasoning_content: Option<&str>) -> Self {
+    pub fn with_tool_calls(
+        role: Role,
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        reasoning_content: Option<&str>,
+    ) -> Self {
         Self {
             role,
             content: Some(content.to_string()),
@@ -100,9 +100,7 @@ pub enum FinishReason {
     Stop,
     Length,
     ToolCalls,
-    ContentFilter,
 }
-
 
 impl Display for FinishReason {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -110,7 +108,6 @@ impl Display for FinishReason {
             FinishReason::Stop => write!(f, "stop"),
             FinishReason::Length => write!(f, "length"),
             FinishReason::ToolCalls => write!(f, "tool_calls"),
-            FinishReason::ContentFilter => write!(f, "content_filter"),
         }
     }
 }
@@ -140,7 +137,7 @@ pub struct FunctionParameters {
 pub enum ToolChoice {
     // Handles string flags: "none", "auto", "required"
     Mode(ToolChoiceMode),
-    
+
     // Handles forcing a specific function call
     Specific(SpecificToolChoice),
 }
@@ -174,7 +171,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionDefinition {
     pub name: String,
-    pub arguments: HashMap<String, Value>, 
+    pub arguments: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -225,9 +222,9 @@ pub struct ChunkToolCall {
 pub struct ChunkFunctionCall {
     // Only present on the first chunk initiating the function call
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>, 
+    pub name: Option<String>,
     // Essential: Pieces of the JSON argument string stream over time
-    pub arguments: String, 
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,14 +250,16 @@ pub struct TopLogprobs {
 
 #[derive(Clone, Serialize)]
 pub enum ModelCacheFragmentation {
-    BlockWise{block_size: usize},
+    BlockWise { block_size: usize },
     TokenWise,
 }
 
 impl Debug for ModelCacheFragmentation {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            ModelCacheFragmentation::BlockWise { block_size } => write!(f, "BlockWise({block_size})"),
+            ModelCacheFragmentation::BlockWise { block_size } => {
+                write!(f, "BlockWise({block_size})")
+            }
             ModelCacheFragmentation::TokenWise => write!(f, "TokenWise"),
         }
     }
@@ -269,7 +268,9 @@ impl Debug for ModelCacheFragmentation {
 impl Display for ModelCacheFragmentation {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            ModelCacheFragmentation::BlockWise { block_size } => write!(f, "BlockWise({block_size})"),
+            ModelCacheFragmentation::BlockWise { block_size } => {
+                write!(f, "BlockWise({block_size})")
+            }
             ModelCacheFragmentation::TokenWise => write!(f, "TokenWise"),
         }
     }
@@ -285,19 +286,28 @@ impl<'de> Deserialize<'de> for ModelCacheFragmentation {
             type Value = ModelCacheFragmentation;
 
             fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
-                formatter.write_str("a fragmentation format like \"BlockWise(32)\" or \"TokenWise\"")
+                formatter
+                    .write_str("a fragmentation format like \"BlockWise(32)\" or \"TokenWise\"")
             }
 
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ModelCacheFragmentation, E> {
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> Result<ModelCacheFragmentation, E> {
                 if value == "TokenWise" {
                     return Ok(ModelCacheFragmentation::TokenWise);
                 }
-                if let Some(rest) = value.strip_prefix("BlockWise(").and_then(|s| s.strip_suffix(')')) {
-                    if let Ok(block_size) = rest.parse::<usize>() {
-                        return Ok(ModelCacheFragmentation::BlockWise { block_size });
-                    }
+                if let Some(rest) = value
+                    .strip_prefix("BlockWise(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    && let Ok(block_size) = rest.parse::<usize>() 
+                {
+                    return Ok(ModelCacheFragmentation::BlockWise { block_size });
                 }
-                Err(serde::de::Error::custom(format!("invalid fragmentation format: {}", value)))
+                Err(serde::de::Error::custom(format!(
+                    "invalid fragmentation format: {}",
+                    value
+                )))
             }
         }
         deserializer.deserialize_str(FragmentationVisitor)

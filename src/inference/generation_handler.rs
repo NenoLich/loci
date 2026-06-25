@@ -1,5 +1,8 @@
-use crate::inference::{Sampler, ReasoningSupervisor, ToolCallingSupervisor, GenerationDataType, GenerationEvent, SamplingResult};
-use crate::types::{ChunkToolCall, ToolCall};
+use crate::inference::{
+    GenerationDataType, GenerationEvent, ReasoningSupervisor, Sampler, SamplingResult,
+    ToolCallingSupervisor,
+};
+use crate::types::ToolCall;
 
 use candle_core::Tensor;
 
@@ -17,20 +20,20 @@ pub struct GenerationHandler<'a> {
 impl<'a> GenerationHandler<'a> {
     pub fn new(
         input_tokens: &[u32],
-        mut sampler: Box<dyn Sampler>,
+        sampler: Box<dyn Sampler>,
         mut reasoning_supervisor: Option<ReasoningSupervisor>,
         mut tool_calling_supervisor: Option<ToolCallingSupervisor<'a>>,
         eos_token_id: u32,
         mut tool_choice_template: Option<Vec<u32>>,
-    )-> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self> {
         let mut ongoing_gen_type = GenerationDataType::DirectContent;
         let mut tokens_to_force = vec![];
         if let Some(reasoning_supervisor) = reasoning_supervisor.as_mut() {
-            match reasoning_supervisor.advance(&input_tokens, &ongoing_gen_type) {
-                GenerationEvent::ReasoningStarted { .. } => {
+            match reasoning_supervisor.advance(input_tokens, &ongoing_gen_type) {
+                GenerationEvent::ReasoningStarted => {
                     ongoing_gen_type = GenerationDataType::Reasoning;
                 }
-                GenerationEvent::ReasoningStopped { .. } => {
+                GenerationEvent::ReasoningStopped => {
                     ongoing_gen_type = GenerationDataType::DirectContent;
                 }
                 GenerationEvent::ForceTokens { tokens } => {
@@ -40,19 +43,17 @@ impl<'a> GenerationHandler<'a> {
             }
         }
 
-        if let Some(tool_calling_supervisor) = tool_calling_supervisor.as_mut() {
-            match tool_calling_supervisor.advance(&input_tokens, &ongoing_gen_type)? {
-                GenerationEvent::ToolCallStarted => {
-                    ongoing_gen_type = GenerationDataType::ToolCallName;
-                }
-                _ => {}
-            }
+        if let Some(tool_calling_supervisor) = tool_calling_supervisor.as_mut()
+            && let GenerationEvent::ToolCallStarted =
+                tool_calling_supervisor.advance(input_tokens, &ongoing_gen_type)?
+        {
+            ongoing_gen_type = GenerationDataType::ToolCallName;
         }
 
-        if ongoing_gen_type == GenerationDataType::DirectContent {
-            if let Some(template) = tool_choice_template.take() {
-                tokens_to_force.extend(template);
-            }
+        if ongoing_gen_type == GenerationDataType::DirectContent
+            && let Some(template) = tool_choice_template.take()
+        {
+            tokens_to_force.extend(template);
         }
 
         Ok(Self {
@@ -67,10 +68,6 @@ impl<'a> GenerationHandler<'a> {
         })
     }
 
-    pub fn gen_type(&self) -> GenerationDataType {
-        self.ongoing_gen_type.clone()
-    }
-
     pub fn reasoning_token_count(&self) -> u32 {
         if let Some(ref reasoning_supervisor) = self.reasoning_supervisor {
             reasoning_supervisor.reasoning_tokens_count()
@@ -83,10 +80,16 @@ impl<'a> GenerationHandler<'a> {
         self.input_tokens = input_tokens.to_vec();
     }
 
-    pub fn advance(&mut self, logits: &Tensor, with_logprobs: bool, top_k_logprobs: Option<usize>) -> anyhow::Result<GenerationEvent> {
+    pub fn advance(
+        &mut self,
+        logits: &Tensor,
+        with_logprobs: bool,
+        top_k_logprobs: Option<usize>,
+    ) -> anyhow::Result<GenerationEvent> {
         let sampling_result = if self.tokens_to_force.is_empty() {
             if with_logprobs {
-                self.sampler.sample(logits, Some(top_k_logprobs.unwrap_or(0)))?
+                self.sampler
+                    .sample(logits, Some(top_k_logprobs.unwrap_or(0)))?
             } else {
                 self.sampler.sample(logits, None)?
             }
@@ -105,10 +108,10 @@ impl<'a> GenerationHandler<'a> {
 
         if let Some(reasoning_supervisor) = self.reasoning_supervisor.as_mut() {
             match reasoning_supervisor.advance(&[sampling_result.token], &self.ongoing_gen_type) {
-                GenerationEvent::ReasoningStarted { .. } => {
+                GenerationEvent::ReasoningStarted => {
                     self.ongoing_gen_type = GenerationDataType::Reasoning;
                 }
-                GenerationEvent::ReasoningStopped { .. } => {
+                GenerationEvent::ReasoningStopped => {
                     self.ongoing_gen_type = GenerationDataType::DirectContent;
                     return Ok(GenerationEvent::ReasoningSampled { sampling_result });
                 }
@@ -124,7 +127,9 @@ impl<'a> GenerationHandler<'a> {
         }
 
         if let Some(tool_calling_supervisor) = self.tool_calling_supervisor.as_mut() {
-            match tool_calling_supervisor.advance(&[sampling_result.token], &self.ongoing_gen_type)? {
+            match tool_calling_supervisor
+                .advance(&[sampling_result.token], &self.ongoing_gen_type)?
+            {
                 GenerationEvent::ToolCallStarted => {
                     self.ongoing_gen_type = GenerationDataType::ToolCallName;
                     return Ok(GenerationEvent::ToolCallStarted);
@@ -160,7 +165,6 @@ impl<'a> GenerationHandler<'a> {
         }
 
         Ok(GenerationEvent::None)
-
     }
 
     pub fn soft_stop(&mut self) {
@@ -168,7 +172,9 @@ impl<'a> GenerationHandler<'a> {
     }
 
     pub fn force_tool_choice(&mut self) {
-        if self.ongoing_gen_type == GenerationDataType::DirectContent && let Some(template) = self.tool_choice_template.take() {
+        if self.ongoing_gen_type == GenerationDataType::DirectContent
+            && let Some(template) = self.tool_choice_template.take()
+        {
             self.tokens_to_force.extend(template);
         }
     }

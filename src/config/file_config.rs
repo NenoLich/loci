@@ -1,15 +1,15 @@
-use serde::{Deserialize};
+use serde::Deserialize;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
-use crate::types::{ToolChoice, ReasoningEffort, ModelCacheFragmentation};
 use crate::error::LociError;
+use crate::types::{ModelCacheFragmentation, ReasoningEffort, ToolChoice};
 
 #[derive(Debug, Copy, Clone, clap::ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputeDtype {
     F32,
-    F16
+    F16,
 }
 
 impl Display for ComputeDtype {
@@ -33,9 +33,10 @@ pub struct FileConfig {
 
 impl FileConfig {
     pub fn load(filename: impl AsRef<Path>) -> Result<Self, LociError> {
-        let config = std::fs::read_to_string(filename)
-            .map_err(|e| LociError::Io(e))?;
-        Ok(toml::from_str(&config).map_err(|e| LociError::Config{ source: Box::new(e) })?)
+        let config = std::fs::read_to_string(filename).map_err(LociError::Io)?;
+        toml::from_str(&config).map_err(|e| LociError::Config {
+            source: Box::new(e),
+        })
     }
 }
 

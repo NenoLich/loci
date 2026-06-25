@@ -10,26 +10,27 @@ pub fn stdout_callback(stream_frame: StreamFrame) -> Result<(), LociError> {
                 if let Some(name) = tool_call_chunk.function.name {
                     print!("\n Tool Call:\n");
                     format!("{}: ", name).blue().bold()
-                }
-                else {
+                } else {
                     "".normal()
                 }
             } else {
                 "".normal()
             }
-        },
+        }
         GenerationDataType::ToolCallArguments => {
             if let Some(tool_call_chunk) = stream_frame.tool_call_chunk {
                 tool_call_chunk.function.arguments.bright_cyan()
             } else {
                 "".normal()
             }
-        },
+        }
         GenerationDataType::Reasoning => stream_frame.output.bright_black().italic(),
     };
 
     print!("{}", output_chunk);
     use std::io::Write;
-    std::io::stdout().flush().map_err(|e| LociError::Stream(e.to_string()))?;
+    std::io::stdout()
+        .flush()
+        .map_err(|e| LociError::Stream(e.to_string()))?;
     Ok(())
 }

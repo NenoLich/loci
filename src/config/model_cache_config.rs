@@ -1,4 +1,4 @@
-use std::path::{PathBuf, Path};
+use std::path::{Path, PathBuf};
 
 use crate::config::CacheFileConfig;
 use crate::types::ModelCacheFragmentation;
@@ -37,7 +37,7 @@ pub struct ModelCacheConfigBuilder {
     max_cache_size: Option<u64>,
     min_cache_tokens: Option<usize>,
     cache_block_size: Option<usize>,
-    file_config: Option<CacheFileConfig>
+    file_config: Option<CacheFileConfig>,
 }
 
 impl ModelCacheConfigBuilder {
@@ -71,25 +71,38 @@ impl ModelCacheConfigBuilder {
     pub fn build(self) -> ModelCacheConfig {
         let default = ModelCacheConfig::default();
         let fragmentation = if let Some(block_size) = self.cache_block_size {
-            ModelCacheFragmentation::BlockWise { block_size }
+            if block_size == 1 {
+                ModelCacheFragmentation::TokenWise
+            } else {
+                ModelCacheFragmentation::BlockWise { block_size }
+            }
         } else {
-            self.file_config.as_ref()
+            self.file_config
+                .as_ref()
                 .and_then(|c| c.fragmentation.clone())
                 .unwrap_or(default.fragmentation)
         };
         ModelCacheConfig {
-            prefix_caching: self.prefix_caching
+            prefix_caching: self
+                .prefix_caching
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.prefix_caching))
                 .unwrap_or(default.prefix_caching),
-            cache_dir: self.cache_dir
-                .or_else(|| self.file_config.as_ref().and_then(|c| {
-                    c.cache_dir.as_ref().and_then(|cache_dir_str| Some(PathBuf::from(cache_dir_str)))
-                }))
+            cache_dir: self
+                .cache_dir
+                .or_else(|| {
+                    self.file_config.as_ref().and_then(|c| {
+                        c.cache_dir
+                            .as_ref()
+                            .map(PathBuf::from)
+                    })
+                })
                 .unwrap_or(default.cache_dir),
-            max_cache_size: self.max_cache_size
+            max_cache_size: self
+                .max_cache_size
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.max_cache_size))
                 .unwrap_or(default.max_cache_size),
-            min_cache_tokens: self.min_cache_tokens
+            min_cache_tokens: self
+                .min_cache_tokens
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.min_cache_tokens))
                 .unwrap_or(default.min_cache_tokens),
             fragmentation,

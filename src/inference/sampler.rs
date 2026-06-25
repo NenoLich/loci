@@ -1,8 +1,7 @@
-use candle_core::{Result, Tensor};
-use rand::distr::{Distribution, weighted::WeightedIndex};
-use std::collections::HashMap;
 use crate::config::GenerationConfig;
-use crate::types::{ToolChoiceMode, ToolChoice};
+use crate::types::{ToolChoice, ToolChoiceMode};
+use candle_core::Tensor;
+use rand::distr::{Distribution, weighted::WeightedIndex};
 
 #[derive(Debug, Clone)]
 pub struct SamplingResult {
@@ -17,7 +16,11 @@ pub struct TopKEntry {
     pub logprob: f32,
 }
 pub trait Sampler {
-    fn sample(&mut self, logits: &Tensor, top_k_logprobs: Option<usize>) -> anyhow::Result<SamplingResult>;
+    fn sample(
+        &mut self,
+        logits: &Tensor,
+        top_k_logprobs: Option<usize>,
+    ) -> anyhow::Result<SamplingResult>;
     fn add_token(&mut self, token_id: u32);
 }
 
@@ -37,15 +40,21 @@ pub struct InferenceSampler {
 
 impl InferenceSampler {
     /// Configures a new standalone logic processor
-    pub fn new(config: GenerationConfig, special_token_ids: Vec<u32>, vocab_size: usize, penalty_window: usize, tool_start_token_id: Option<u32>) -> Self {
-        use rand::SeedableRng;
+    pub fn new(
+        config: GenerationConfig,
+        special_token_ids: Vec<u32>,
+        vocab_size: usize,
+        penalty_window: usize,
+        tool_start_token_id: Option<u32>,
+    ) -> Self {
         Self {
             special_token_ids,
             temperature: config.temperature.max(0.0),
             top_p: config.top_p.clamp(0.0, 1.0),
             repetition_penalty: config.repetition_penalty.max(1.0),
-            is_tool_call_forbidden: config.tool_choice == ToolChoice::Mode(ToolChoiceMode::None) && tool_start_token_id.is_some(),
-            tool_start_token_id: tool_start_token_id.and_then(|v| Some(v as usize)),
+            is_tool_call_forbidden: config.tool_choice == ToolChoice::Mode(ToolChoiceMode::None)
+                && tool_start_token_id.is_some(),
+            tool_start_token_id: tool_start_token_id.map(|v| v as usize),
             rng: {
                 let seed_bytes = (config.seed as u128).to_le_bytes();
                 let mut rng_seed = [0u8; 32];
@@ -64,8 +73,8 @@ impl InferenceSampler {
 
     /// Records generated tokens to accurately calculate loop penalties
     fn record_token(&mut self, token_id: u32) {
-        if self.history_window.is_empty() || self.special_token_ids.contains(&token_id) { 
-            return; 
+        if self.history_window.is_empty() || self.special_token_ids.contains(&token_id) {
+            return;
         }
         self.history_window[self.history_head] = token_id;
         self.history_head = (self.history_head + 1) % self.history_window.len();
@@ -73,12 +82,16 @@ impl InferenceSampler {
 
     /// Primary entry point: transforms raw logits and samples a single token ID
     #[tracing::instrument(level = "debug", skip_all)]
-    fn sample_impl(&mut self, logits: &Tensor, top_k_logprobs: Option<usize>) -> anyhow::Result<SamplingResult> {
+    fn sample_impl(
+        &mut self,
+        logits: &Tensor,
+        top_k_logprobs: Option<usize>,
+    ) -> anyhow::Result<SamplingResult> {
         // 1. Ensure logits are flattened to a 1D vector representing the final prediction step
         let logits_tensor = if logits.rank() == 1 {
             logits.clone()
         } else {
-            logits.flatten_all()?  
+            logits.flatten_all()?
         };
 
         let cpu_logits = logits_tensor
@@ -86,7 +99,7 @@ impl InferenceSampler {
             .to_device(&candle_core::Device::Cpu)?;
 
         let (storage, layout) = cpu_logits.storage_and_layout();
-        
+
         if let candle_core::Storage::Cpu(cpu_storage) = &*storage {
             let entire_raw_slice: &[f32] = cpu_storage.as_slice()?;
             let start_offset = layout.start_offset();
@@ -114,17 +127,18 @@ impl InferenceSampler {
         }
 
         // Ban Tool Call
-        if self.is_tool_call_forbidden {
-            if let Some(tool_start_token_id) = self.tool_start_token_id {
-                if tool_start_token_id < vocab_len {
-                    self.logits_buffer[tool_start_token_id] = f32::NEG_INFINITY;
-                }
-            }
+        if self.is_tool_call_forbidden
+            && let Some(tool_start_token_id) = self.tool_start_token_id
+            && tool_start_token_id < vocab_len
+        {
+            self.logits_buffer[tool_start_token_id] = f32::NEG_INFINITY;
         }
 
         // 3. Handle Greedy Sampling (If Temp is 0, pick highest score directly)
         if self.temperature == 0.0 {
-            let sampled = self.logits_buffer.iter()
+            let sampled = self
+                .logits_buffer
+                .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as u32)
@@ -152,7 +166,7 @@ impl InferenceSampler {
         for i in 0..vocab_len {
             let exp_val = (self.logits_buffer[i] - max_logit).exp();
             // Temporarily use sort_buffer to cache raw exponent numbers safely
-            self.sort_buffer[i] = (i, exp_val); 
+            self.sort_buffer[i] = (i, exp_val);
             sum_exponents += exp_val;
         }
 
@@ -162,12 +176,13 @@ impl InferenceSampler {
             let true_prob = self.sort_buffer[i].1 * inv_sum;
             self.logits_buffer[i] = true_prob;
             // Overwrite sort_buffer with true normalized states for the Top-P step
-            self.sort_buffer[i] = (i, true_prob); 
+            self.sort_buffer[i] = (i, true_prob);
         }
 
         // 6. Apply Top-P
         if self.top_p < 1.0 {
-            self.sort_buffer.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            self.sort_buffer
+                .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
             let mut cumulative_sum = 0.0;
             let mut cut_off = vocab_len;
@@ -200,17 +215,20 @@ impl InferenceSampler {
                 range.sample(&mut self.rng) as u32
             }
         };
-        
+
         self.record_token(sampled_token);
 
         // 8. Calculate Logprobs for the Top-K tokens
         let (logprob, top_k_logprobs) = if let Some(top_k_logprobs) = top_k_logprobs {
             let top_k = top_k_logprobs.clamp(0, 5);
             if self.top_p >= 1.0 {
-                self.sort_buffer.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                self.sort_buffer
+                    .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             }
 
-            let chosen_true_prob = self.sort_buffer.iter()
+            let chosen_true_prob = self
+                .sort_buffer
+                .iter()
                 .find(|&&(idx, _)| idx == sampled_token as usize)
                 .map(|&(_, prob)| prob)
                 .unwrap_or(1e-45);
@@ -238,7 +256,11 @@ impl InferenceSampler {
 }
 
 impl Sampler for InferenceSampler {
-    fn sample(&mut self, logits: &Tensor, top_k_logprobs: Option<usize>) -> anyhow::Result<SamplingResult> {
+    fn sample(
+        &mut self,
+        logits: &Tensor,
+        top_k_logprobs: Option<usize>,
+    ) -> anyhow::Result<SamplingResult> {
         self.sample_impl(logits, top_k_logprobs)
     }
 

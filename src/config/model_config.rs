@@ -3,8 +3,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use crate::config::{Deepseek2Parser, Lfm2Parser};
 use crate::gguf::GgufInfo;
-use crate::config::{Lfm2Parser, Deepseek2Parser};
 use crate::inference::ToolFormatStyle;
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ impl fmt::Display for ModelArchitecture {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ModelConfig {
     pub file_path: PathBuf,
@@ -94,7 +95,6 @@ impl ModelConfig {
         match arch {
             ModelArchitecture::Lfm2 => Lfm2Parser::parse(gguf_info),
             ModelArchitecture::Deepseek2 => Deepseek2Parser::parse(gguf_info),
-            _ => bail!("Unsupported model architecture: {}", arch),
         }
     }
 }

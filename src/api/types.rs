@@ -1,15 +1,14 @@
-use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Value, json};
-use axum::extract::{FromRequest, Request};
-use axum::response::{Response, IntoResponse};
-use axum::http::StatusCode;
 use axum::Json;
+use axum::extract::{FromRequest, Request};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-use crate::types::{Role, ChatMessage, ReasoningEffort, Tool, ToolChoice, ToolChoiceMode, ChunkToolCall, ChunkLogprob, FinishReason, Usage};
-
-use std::collections::HashMap;
-use std::fmt::{self, Display, Formatter};
-use uuid::Uuid;
+use crate::types::{
+    ChatMessage, ChunkLogprob, ChunkToolCall, FinishReason, ReasoningEffort, Role, Tool,
+    ToolChoice, ToolChoiceMode, Usage,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -43,7 +42,7 @@ pub struct ChatCompletionResponse {
     pub object: String,
     pub created: u64,
     pub model: String,
-    pub system_fingerprint: String, 
+    pub system_fingerprint: String,
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
 }
@@ -62,7 +61,7 @@ pub struct ChatCompletionChunk {
     pub object: String,
     pub created: u64,
     pub model: String,
-    pub system_fingerprint: String, 
+    pub system_fingerprint: String,
     // In the last chunk (if include_usage is true), this array will be EMPTY []
     pub choices: Vec<ChunkChoice>,
     // Only populated on the very last chunk when stream_options.include_usage = true
@@ -113,17 +112,13 @@ pub struct ValidatedChatCompletionRequest {
     pub seed: Option<usize>,
 }
 
-impl<S> FromRequest<S> for ValidatedChatCompletionRequest 
-where 
+impl<S> FromRequest<S> for ValidatedChatCompletionRequest
+where
     S: Send + Sync,
 {
     type Rejection = Response;
 
-    async fn from_request(
-        req: Request,
-        state: &S,
-    ) -> Result<Self, Self::Rejection>
-    {
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let Json(payload) = Json::<ChatCompletionRequest>::from_request(req, state)
             .await
             .map_err(|e| {
@@ -154,9 +149,19 @@ where
 
         if !messages.is_empty() {
             for message in &messages {
-                if message.role == Role::User && message.content.as_ref().is_some_and(|content| !content.is_empty()) {
+                if message.role == Role::User
+                    && message
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| !content.is_empty())
+                {
                     has_user_message = true;
-                } else if message.role == Role::System && message.content.as_ref().is_some_and(|content| !content.is_empty()) {
+                } else if message.role == Role::System
+                    && message
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| !content.is_empty())
+                {
                     has_system_message = true;
                 }
             }
@@ -174,8 +179,8 @@ where
 
         if !has_system_message {
             messages.insert(
-                0, 
-                ChatMessage::new(Role::System, "You are a helpful assistant")
+                0,
+                ChatMessage::new(Role::System, "You are a helpful assistant"),
             );
         }
 

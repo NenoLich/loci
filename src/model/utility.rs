@@ -1,6 +1,6 @@
-use candle_core::{Tensor, Device, DType, Module};
-use candle_transformers::quantized_var_builder::VarBuilder;
 use candle_core::quantized::{GgmlDType, QMatMul};
+use candle_core::{DType, Device, Module, Tensor};
+use candle_transformers::quantized_var_builder::VarBuilder;
 use once_cell::sync::OnceCell;
 
 use crate::model::MixedCache;
@@ -24,7 +24,10 @@ pub fn qmatmul_forward(qmatmul: &QMatMul, xs: &Tensor) -> anyhow::Result<Tensor>
     Ok(match xs.dtype() {
         DType::F16 => qmatmul.forward_via_f16(xs)?,
         DType::F32 => qmatmul.forward(xs)?,
-        _ => anyhow::bail!("Unsupported dtype: {:?} for qmatmul forward operation", xs.dtype()),
+        _ => anyhow::bail!(
+            "Unsupported dtype: {:?} for qmatmul forward operation",
+            xs.dtype()
+        ),
     })
 }
 
@@ -70,25 +73,6 @@ pub fn find_norm_prefix(vb: VarBuilder) -> String {
     "output_norm".to_string() // Fallback
 }
 
-pub fn nonzero_1d(t: &Tensor) -> anyhow::Result<Tensor> {
-    let device = t.device();
-    // Convert tensor to a flat vector of floats to find indices on CPU
-    let data = t.flatten_all()?.to_vec1::<f32>()?;
-    
-    let indices: Vec<u32> = data.iter()
-        .enumerate()
-        .filter(|&(_, &val)| val != 0.0)
-        .map(|(idx, _)| idx as u32)
-        .collect();
-
-    if indices.is_empty() {
-        // Return an empty tensor of the correct dtype for indexing
-        Ok(Tensor::from_slice(&[] as &[u32], (0,), device)?)
-    } else {
-        Ok(Tensor::from_vec(indices.clone(), (indices.len(),), device)?)
-    }
-}
-
 /// Rotary Position Embeddings (RoPE) for LFM2.
 ///
 /// RoPE encodes position information by rotating query and key vectors
@@ -122,19 +106,26 @@ impl RotaryEmbedding {
             .collect();
         let freqs = Tensor::new(freqs, device)?.to_dtype(DType::F32)?;
         let positions = Tensor::arange(0u32, max_seq_len as u32, device)?.to_dtype(DType::F32)?;
-        let freqs = positions.reshape((max_seq_len, 1))?.matmul(&freqs.reshape((1, ()))?)?;
+        let freqs = positions
+            .reshape((max_seq_len, 1))?
+            .matmul(&freqs.reshape((1, ()))?)?;
 
         let freqs = if interleaved {
             // Pattern: [f1, f1, f2, f2...]
-            freqs.unsqueeze(2)?.repeat(vec![1, 1, 2])?.reshape((max_seq_len, head_dim))?
+            freqs
+                .unsqueeze(2)?
+                .repeat(vec![1, 1, 2])?
+                .reshape((max_seq_len, head_dim))?
         } else {
             // Pattern: [f1, f2, f1, f2...]
             Tensor::cat(&[&freqs, &freqs], 1)?
         };
 
-        Ok(Self { cos: freqs.cos()?, sin: freqs.sin()? })
+        Ok(Self {
+            cos: freqs.cos()?,
+            sin: freqs.sin()?,
+        })
     }
-
 
     /// Apply rotary position embeddings to a tensor.
     ///
@@ -172,9 +163,7 @@ impl RotaryEmbedding {
         let rotated = (x_f32.broadcast_mul(&cos)? + x_rotated.broadcast_mul(&sin)?)?;
 
         // Cast back to original dtype
-        rotated
-            .to_dtype(original_dtype)
-            .map_err(anyhow::Error::msg)
+        rotated.to_dtype(original_dtype).map_err(anyhow::Error::msg)
     }
 
     pub fn forward_interleaved(&self, x: &Tensor, pos: usize) -> anyhow::Result<Tensor> {
@@ -182,23 +171,27 @@ impl RotaryEmbedding {
         let (b, h, seq_len, head_dim) = x.dims4()?;
 
         // 1. Prepare Cos/Sin
-        let cos = self.cos.narrow(0, pos, seq_len)?
+        let cos = self
+            .cos
+            .narrow(0, pos, seq_len)?
             .reshape((1, 1, seq_len, head_dim))?;
-        let sin = self.sin.narrow(0, pos, seq_len)?
+        let sin = self
+            .sin
+            .narrow(0, pos, seq_len)?
             .reshape((1, 1, seq_len, head_dim))?;
 
         let x_f32 = x.to_dtype(candle_core::DType::F32)?;
 
         // 2. Interleaved rotate_half:
         // We want to transform [x0, x1, x2, x3] into [-x1, x0, -x3, x2]
-        
+
         // Reshape to group pairs: [b, h, s, head_dim/2, 2]
         let x_pairs = x_f32.reshape((b, h, seq_len, head_dim / 2, 2))?;
-        
+
         // Slice x0 and x1 from the last dimension
         let x0 = x_pairs.narrow(candle_core::D::Minus1, 0, 1)?;
         let x1 = x_pairs.narrow(candle_core::D::Minus1, 1, 1)?;
-        
+
         // Create interleaved rotated: concat([-x1, x0]) and flatten back
         let x_rotated = Tensor::cat(&[&x1.neg()?, &x0], candle_core::D::Minus1)?
             .reshape((b, h, seq_len, head_dim))?;
@@ -208,7 +201,6 @@ impl RotaryEmbedding {
 
         rotated.to_dtype(original_dtype).map_err(anyhow::Error::msg)
     }
-
 }
 
 /// Build a causal attention mask for the given sequence length.
@@ -220,13 +212,16 @@ pub fn get_mask(
     dtype: DType,
     device: &Device,
 ) -> anyhow::Result<Tensor> {
-    let indices = mask_indices.get_or_try_init(|| {
-        Tensor::arange(0u32, max_seq_len as u32, device)
-    })?;
+    let indices =
+        mask_indices.get_or_try_init(|| Tensor::arange(0u32, max_seq_len as u32, device))?;
     let idx = indices.narrow(0, 0, seq_len)?;
 
-    let i = idx.reshape((seq_len, 1))?.broadcast_as((seq_len, seq_len))?;
-    let j = idx.reshape((1, seq_len))?.broadcast_as((seq_len, seq_len))?;
+    let i = idx
+        .reshape((seq_len, 1))?
+        .broadcast_as((seq_len, seq_len))?;
+    let j = idx
+        .reshape((1, seq_len))?
+        .broadcast_as((seq_len, seq_len))?;
     let mask = i.lt(&j)?;
 
     let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?
@@ -246,11 +241,9 @@ pub fn update_cache(
     cache: &mut Option<MixedCache>,
 ) -> anyhow::Result<(Tensor, Tensor)> {
     match cache {
-        Some(MixedCache::KvCache(kv_cache)) => {
-            kv_cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?)
-                .map_err(anyhow::Error::msg)
-        }
+        Some(MixedCache::KvCache(kv_cache)) => kv_cache
+            .append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?)
+            .map_err(anyhow::Error::msg),
         _ => Ok((k, v)),
     }
 }
-

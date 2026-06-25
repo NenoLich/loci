@@ -38,9 +38,15 @@ impl From<&[GgufKVMeta]> for TokenizerConfig {
 
         for kv_meta in metadata {
             match kv_meta.key.as_str() {
-                "tokenizer.ggml.hf_json" => json_config = kv_meta.value.as_string().map(|v| v.to_string()),
-                "tokenizer.ggml.model" => model_type = kv_meta.value.as_string().map(|v| v.to_string()),
-                "tokenizer.ggml.pre" => pre_tokenizer_tag = kv_meta.value.as_string().map(|v| v.to_string()),
+                "tokenizer.ggml.hf_json" => {
+                    json_config = kv_meta.value.as_string().map(|v| v.to_string())
+                }
+                "tokenizer.ggml.model" => {
+                    model_type = kv_meta.value.as_string().map(|v| v.to_string())
+                }
+                "tokenizer.ggml.pre" => {
+                    pre_tokenizer_tag = kv_meta.value.as_string().map(|v| v.to_string())
+                }
                 "tokenizer.ggml.tokens" => {
                     tokens = kv_meta.value.as_slice().and_then(|slice| {
                         slice
@@ -65,7 +71,9 @@ impl From<&[GgufKVMeta]> for TokenizerConfig {
                             .collect::<Option<Vec<String>>>()
                     })
                 }
-                "tokenizer.chat_template" => chat_template = kv_meta.value.as_string().map(|v| v.to_string()),
+                "tokenizer.chat_template" => {
+                    chat_template = kv_meta.value.as_string().map(|v| v.to_string())
+                }
                 "tokenizer.ggml.bos_token_id" => bos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.eos_token_id" => eos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.padding_token_id" => padding_token_id = kv_meta.value.as_u32(),

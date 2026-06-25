@@ -2,9 +2,9 @@ use candle_core::{DType, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_transformers::quantized_var_builder::VarBuilder;
 
+use crate::config::{InferenceConfig, ModelArchitecture, ModelConfig};
 use crate::error::LociError;
-use crate::config::{ModelArchitecture, ModelConfig, InferenceConfig};
-use crate::model::{Lfm2Model, Deepseek2Model};
+use crate::model::{Deepseek2Model, Lfm2Model};
 
 #[derive(Debug, Clone)]
 pub struct ModelCacheInfo {
@@ -52,7 +52,7 @@ pub trait Model {
 #[derive(Debug, Clone)]
 pub enum ModelCacheType {
     FullAttn,
-    MixedWithConv{conv_l_cache: usize},
+    MixedWithConv { conv_l_cache: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +70,11 @@ pub struct ModelBuilder {
 }
 
 impl ModelBuilder {
-    pub fn new(config: ModelConfig, var_builder: VarBuilder, inference_config: &InferenceConfig) -> Self {
+    pub fn new(
+        config: ModelConfig,
+        var_builder: VarBuilder,
+        inference_config: &InferenceConfig,
+    ) -> Self {
         Self {
             config,
             var_builder,
@@ -82,14 +86,25 @@ impl ModelBuilder {
 
     pub fn build(self) -> Result<Box<dyn Model + Send + Sync>, LociError> {
         match self.config.architecture {
-            ModelArchitecture::Lfm2 => {
-                Ok(Box::new(Lfm2Model::load(self.config, self.var_builder, self.compute_dtype, self.max_seq_len, self.conv_on_cpu)
-                    .map_err(|e| LociError::ModelLoad(e.to_string()))?))
-            }
-            ModelArchitecture::Deepseek2 => {
-                Ok(Box::new(Deepseek2Model::load(self.config, self.var_builder, self.compute_dtype, self.max_seq_len)
-                    .map_err(|e| LociError::ModelLoad(e.to_string()))?))
-            },
+            ModelArchitecture::Lfm2 => Ok(Box::new(
+                Lfm2Model::load(
+                    self.config,
+                    self.var_builder,
+                    self.compute_dtype,
+                    self.max_seq_len,
+                    self.conv_on_cpu,
+                )
+                .map_err(|e| LociError::ModelLoad(e.to_string()))?,
+            )),
+            ModelArchitecture::Deepseek2 => Ok(Box::new(
+                Deepseek2Model::load(
+                    self.config,
+                    self.var_builder,
+                    self.compute_dtype,
+                    self.max_seq_len,
+                )
+                .map_err(|e| LociError::ModelLoad(e.to_string()))?,
+            )),
         }
     }
 }

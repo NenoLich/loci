@@ -3,7 +3,7 @@ use uuid::Uuid;
 use crate::session::Session;
 
 pub struct SessionManager {
-    sessions: Vec<Session>
+    sessions: Vec<Session>,
 }
 
 impl SessionManager {
@@ -17,6 +17,7 @@ impl SessionManager {
         self.sessions.last_mut().unwrap()
     }
 
+    #[allow(dead_code)]
     pub fn get_session_mut(&mut self, id: Uuid) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.id == id)
     }

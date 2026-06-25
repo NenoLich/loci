@@ -1,4 +1,4 @@
-use candle_core::quantized::{GgmlDType, QMatMul};
+use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Tensor};
 #[cfg(feature = "cuda")]
 use candle_flash_attn::flash_attn;
@@ -7,19 +7,21 @@ use candle_nn::{
     Conv1d, Conv1dConfig, Module,
     ops::{silu, softmax},
 };
-use tracing::trace_span;
-use nvtx::{range_push, range_pop};
-use candle_transformers::quantized_nn::{RmsNorm, Embedding};
+use candle_transformers::quantized_nn::{Embedding, RmsNorm};
 use candle_transformers::quantized_var_builder::VarBuilder;
+use nvtx::{range_pop, range_push};
 use once_cell::sync::OnceCell;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
+use tracing::trace_span;
 
-use crate::model::utility::{repeat_kv, get_tensor, find_norm_prefix, qmatmul_forward, get_mask, update_cache, RotaryEmbedding};
+use crate::model::utility::{
+    RotaryEmbedding, find_norm_prefix, get_mask, qmatmul_forward, repeat_kv,
+    update_cache,
+};
 use crate::{
-    model::{Model, MixedCache, ModelCacheType},
-    error::LociError,
     config::ModelConfig,
+    model::{MixedCache, Model, ModelCacheType},
 };
 
 /// LFM2 transformer model implementation.
@@ -93,9 +95,7 @@ impl Lfm2Layer {
             Lfm2Mixer::Attention(attn_mixer) => {
                 attn_mixer.forward(&x, cache, pos, compute_dtype, use_flash)?
             }
-            Lfm2Mixer::ShortConv(conv_mixer) => {
-                conv_mixer.forward(&x, cache, compute_dtype)?
-            }
+            Lfm2Mixer::ShortConv(conv_mixer) => conv_mixer.forward(&x, cache, compute_dtype)?,
         };
         let attn_output = (mixed + input)?;
 
@@ -177,7 +177,7 @@ impl AttentionMixer {
         // 1. Project input to Q, K, V
         let (batch_size, seq_len, _) = x.dims3()?;
         let (q, k, v) = self.project_qkv(&x)?;
-        
+
         // 2. Apply RoPE to Q and K
         let q = self.rope.forward(&q, pos)?;
         let k = self.rope.forward(&k, pos)?;
@@ -195,7 +195,8 @@ impl AttentionMixer {
 
         // 5. Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
         let y = y.reshape((batch_size, seq_len, self.head_dim * self.n_heads))?;
-        Ok(qmatmul_forward(&self.o_proj, &y)?)
+
+        qmatmul_forward(&self.o_proj, &y)
     }
 
     /// Project input to query, key, and value tensors with head dimensions.
@@ -229,8 +230,7 @@ impl AttentionMixer {
         k: Tensor,
         v: Tensor,
         compute_dtype: DType,
-        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-        use_flash: bool,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
 
@@ -287,7 +287,13 @@ impl AttentionMixer {
 
         // Apply causal mask for sequences longer than 1 token
         let attn = if seq_len > 1 {
-            let mask = get_mask(&self.mask_indices, self.max_seq_len, seq_len, compute_dtype, q.device())?;
+            let mask = get_mask(
+                &self.mask_indices,
+                self.max_seq_len,
+                seq_len,
+                compute_dtype,
+                q.device(),
+            )?;
             let attn = attn.to_dtype(compute_dtype)?;
             attn.broadcast_add(&mask)?.to_dtype(DType::F32)?
         } else {
@@ -301,7 +307,6 @@ impl AttentionMixer {
         // Cast back to compute dtype and transpose to [B, S, H, D]
         Ok(y_t.to_dtype(compute_dtype)?.transpose(1, 2)?)
     }
-
 }
 
 /// Short convolution mixer with gating mechanism.
@@ -350,7 +355,7 @@ impl ShortConvMixer {
             [b, c, h] => (b, c, h),
             _ => unreachable!("chunk(3, 2) always returns 3 tensors"),
         };
-        
+
         // 2. First gating: y = B ⊙ h
         let gated = (b_gate * h_signal)?;
 
@@ -363,7 +368,7 @@ impl ShortConvMixer {
         let gated_output = (c_gate * conv_out)?;
 
         // 5. Output projection
-        Ok(qmatmul_forward(&self.out_proj, &gated_output)?)
+        qmatmul_forward(&self.out_proj, &gated_output)
     }
 
     /// Perform convolution with caching support.
@@ -388,7 +393,8 @@ impl ShortConvMixer {
         };
 
         // Prepare input with cache/padding
-        let conv_input = self.prepare_conv_input(&input, cache, batch_size, seq_len, hidden_size)?;
+        let conv_input =
+            self.prepare_conv_input(&input, cache, batch_size, seq_len, hidden_size)?;
 
         // Perform convolution in F32
         let conv_input = conv_input.to_dtype(DType::F32)?;
@@ -482,7 +488,9 @@ impl ShortConvMixer {
             let current_len = input_cached.dims()[2];
             let output_len = seq_len + pad_len;
 
-            *cache = Some(MixedCache::ConvCache(input_cached.clone().to_dtype(DType::F16)?));
+            *cache = Some(MixedCache::ConvCache(
+                input_cached.clone().to_dtype(DType::F16)?,
+            ));
 
             input_cached.narrow(2, current_len - output_len, output_len)?
         } else {
@@ -499,7 +507,6 @@ impl ShortConvMixer {
         })
     }
 }
-
 
 /// Feed-forward network with SwiGLU activation.
 ///
@@ -539,7 +546,7 @@ impl Lfm2Ffn {
         let gated = (gate_activated.to_dtype(self.compute_dtype)? * up)?;
 
         // 3. Down projection
-        Ok(qmatmul_forward(&self.down_proj, &gated)?)
+        qmatmul_forward(&self.down_proj, &gated)
     }
 }
 
@@ -563,19 +570,24 @@ impl Model for Lfm2Model {
     ) -> anyhow::Result<Tensor> {
         // 1. Token embeddings
         range_push!("Embed step");
-        let mut x = self.embed_layer.forward(input)?.to_dtype(self.compute_dtype)?;
+        let mut x = self
+            .embed_layer
+            .forward(input)?
+            .to_dtype(self.compute_dtype)?;
         range_pop!();
         // 2. Transformer layers
         range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_span = trace_span!("layer", layer = i);
-            x = layer_span.in_scope(|| layer.forward(
-                &x,
-                cache.get_mut(i).unwrap(),
-                pos,
-                self.compute_dtype,
-                use_flash,
-            ))?;
+            x = layer_span.in_scope(|| {
+                layer.forward(
+                    &x,
+                    cache.get_mut(i).unwrap(),
+                    pos,
+                    self.compute_dtype,
+                    use_flash,
+                )
+            })?;
         }
         range_pop!();
 
@@ -595,9 +607,7 @@ impl Model for Lfm2Model {
             .layers
             .iter()
             .map(|layer| match &layer.mixer {
-                Lfm2Mixer::Attention(_) => {
-                    Some(MixedCache::KvCache(ConcatKvCache::new(2)))
-                }
+                Lfm2Mixer::Attention(_) => Some(MixedCache::KvCache(ConcatKvCache::new(2))),
                 Lfm2Mixer::ShortConv(_) => None,
             })
             .collect();
@@ -609,8 +619,7 @@ impl Model for Lfm2Model {
     }
 
     fn min_prefill_tokens(&self) -> usize {
-        // self.min_prefill_tokens
-        1
+        self.min_prefill_tokens
     }
 
     fn conv_on_cpu(&self) -> bool {
@@ -622,7 +631,9 @@ impl Model for Lfm2Model {
     }
 
     fn model_cache_type(&self) -> ModelCacheType {
-        ModelCacheType::MixedWithConv { conv_l_cache: self.conv_l_cache - 1 }
+        ModelCacheType::MixedWithConv {
+            conv_l_cache: self.conv_l_cache - 1,
+        }
     }
 
     fn n_layers(&self) -> usize {
@@ -674,8 +685,7 @@ impl Lfm2Model {
 
         // Load embedding normalization
         let embed_norm_prefix = find_norm_prefix(var_builder.clone());
-        let embed_norm =
-            RmsNorm::new(hidden_size, rms_epsilon, var_builder.pp(embed_norm_prefix))?;
+        let embed_norm = RmsNorm::new(hidden_size, rms_epsilon, var_builder.pp(embed_norm_prefix))?;
 
         // Initialize rotary position embeddings
         let rope = Arc::new(RotaryEmbedding::new(
@@ -704,9 +714,13 @@ impl Lfm2Model {
             .collect::<anyhow::Result<Vec<Lfm2Layer>>>()?;
 
         // Find minimum prefill tokens for conv layers (each conv needs kernel_size-1 context)
-        let min_prefill_tokens = config.conv_l_cache.map(|c| c.saturating_sub(1)).unwrap_or(1);
+        let min_prefill_tokens = config
+            .conv_l_cache
+            .map(|c| c.saturating_sub(1))
+            .unwrap_or(1);
         // Compute maximum kernel size across all conv layers for cache block size hint
-        let max_kernel_size = layers.iter()
+        let max_kernel_size = layers
+            .iter()
             .filter_map(|layer| match &layer.mixer {
                 Lfm2Mixer::ShortConv(conv) => Some(conv.kernel_size),
                 Lfm2Mixer::Attention(_) => None,
@@ -751,23 +765,18 @@ impl Lfm2Model {
 
         let rms_epsilon = config.rms_epsilon as f64;
         let n_kv_heads = config.n_kv_heads[block_index];
-        let head_dim = config.hidden_size / config.n_heads;
 
         // 1. Attention normalization
-        let attn_norm =
-            RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("attn_norm"))?;
+        let attn_norm = RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("attn_norm"))?;
 
         // 2. Load mixer (attention or convolution)
         let mixer = if n_kv_heads > 0 {
             Lfm2Mixer::Attention(Self::load_attention_mixer(
                 &var_builder,
                 rope,
-                head_dim,
-                config.n_heads,
+                config,
                 n_kv_heads,
                 effective_max_seq_len,
-                rms_epsilon,
-                compute_dtype,
             )?)
         } else {
             Lfm2Mixer::ShortConv(Self::load_conv_mixer(
@@ -775,13 +784,11 @@ impl Lfm2Model {
                 conv_device,
                 config.conv_l_cache.unwrap_or(3),
                 conv_on_cpu,
-                compute_dtype,
             )?)
         };
 
         // 3. FFN normalization
-        let ffn_norm =
-            RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("ffn_norm"))?;
+        let ffn_norm = RmsNorm::new(config.hidden_size, rms_epsilon, var_builder.pp("ffn_norm"))?;
 
         // 4. Load FFN
         let ffn = Self::load_ffn(&var_builder, compute_dtype)?;
@@ -798,26 +805,18 @@ impl Lfm2Model {
     fn load_attention_mixer(
         var_builder: &VarBuilder,
         rope: Arc<RotaryEmbedding>,
-        head_dim: usize,
-        n_heads: usize,
+        config: &ModelConfig,
         n_kv_heads: usize,
         effective_max_seq_len: usize,
-        rms_epsilon: f64,
-        compute_dtype: DType,
     ) -> anyhow::Result<AttentionMixer> {
+        let rms_epsilon = config.rms_epsilon as f64;
+        let n_heads = config.n_heads;
+        let head_dim = config.hidden_size / config.n_heads;
         Ok(AttentionMixer {
-            q_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("attn_q.weight")?,
-            )?,
-            k_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("attn_k.weight")?,
-            )?,
-            v_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("attn_v.weight")?,
-            )?,
-            o_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("attn_output.weight")?,
-            )?,
+            q_proj: QMatMul::from_arc(var_builder.get_no_shape("attn_q.weight")?)?,
+            k_proj: QMatMul::from_arc(var_builder.get_no_shape("attn_k.weight")?)?,
+            v_proj: QMatMul::from_arc(var_builder.get_no_shape("attn_v.weight")?)?,
+            o_proj: QMatMul::from_arc(var_builder.get_no_shape("attn_output.weight")?)?,
             q_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_q_norm"))?,
             k_norm: RmsNorm::new(head_dim, rms_epsilon, var_builder.pp("attn_k_norm"))?,
             rope,
@@ -835,7 +834,6 @@ impl Lfm2Model {
         conv_device: Device,
         conv_l_cache: usize,
         conv_on_cpu: bool,
-        compute_dtype: DType,
     ) -> anyhow::Result<ShortConvMixer> {
         // Load and prepare convolution weights (depth-wise, so groups = channels)
         let raw_conv_weights = var_builder.get_no_shape("shortconv.conv.weight")?;
@@ -847,18 +845,12 @@ impl Lfm2Model {
             ..Default::default()
         };
 
-        let conv_weights = raw_conv_weights
-            .dequantize(&conv_device)?
-            .unsqueeze(1)?;
+        let conv_weights = raw_conv_weights.dequantize(&conv_device)?.unsqueeze(1)?;
 
         Ok(ShortConvMixer {
-            in_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("shortconv.in_proj.weight")?,
-            )?,
+            in_proj: QMatMul::from_arc(var_builder.get_no_shape("shortconv.in_proj.weight")?)?,
             conv: Conv1d::new(conv_weights, None, conv_cfg),
-            out_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("shortconv.out_proj.weight")?,
-            )?,
+            out_proj: QMatMul::from_arc(var_builder.get_no_shape("shortconv.out_proj.weight")?)?,
             conv_l_cache,
             kernel_size,
             conv_on_cpu,
@@ -868,18 +860,10 @@ impl Lfm2Model {
     /// Load FFN (feed-forward network) for a layer.
     fn load_ffn(var_builder: &VarBuilder, compute_dtype: DType) -> anyhow::Result<Lfm2Ffn> {
         Ok(Lfm2Ffn {
-            up_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("ffn_up.weight")?,
-            )?,
-            gate_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("ffn_gate.weight")?,
-            )?,
-            down_proj: QMatMul::from_arc(
-                var_builder.get_no_shape("ffn_down.weight")?,
-            )?,
+            up_proj: QMatMul::from_arc(var_builder.get_no_shape("ffn_up.weight")?)?,
+            gate_proj: QMatMul::from_arc(var_builder.get_no_shape("ffn_gate.weight")?)?,
+            down_proj: QMatMul::from_arc(var_builder.get_no_shape("ffn_down.weight")?)?,
             compute_dtype,
         })
     }
 }
-
-

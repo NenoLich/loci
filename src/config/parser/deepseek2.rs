@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::gguf::{GgufInfo, GgufKVMeta, GgufValue};
-use crate::config::{ModelConfig, ModelArchitecture}; 
-use crate::inference::ToolFormatStyle;
 use crate::config::parser::build_n_kv_count;
+use crate::config::{ModelArchitecture, ModelConfig};
+use crate::gguf::GgufInfo;
+use crate::inference::ToolFormatStyle;
 
 pub struct DeepSeek2ExtraParameters;
 
@@ -71,19 +71,25 @@ impl Deepseek2Parser {
                     if let Some(value) = entry.value.as_f32() {
                         rms_epsilon = value;
                     }
-                },
+                }
                 "deepseek2.expert_used_count" => n_expert_used = entry.value.as_usize(),
                 "deepseek2.expert_group_count" => n_expert_group = entry.value.as_usize(),
                 "deepseek2.expert_group_used_count" => n_expert_group_used = entry.value.as_usize(),
                 "deepseek2.expert_gating_func" => expert_gating_func = entry.value.as_usize(),
-                "deepseek2.leading_dense_block_count" => n_leading_dense_block = entry.value.as_usize(),
+                "deepseek2.leading_dense_block_count" => {
+                    n_leading_dense_block = entry.value.as_usize()
+                }
                 "deepseek2.vocab_size" => vocab_size = entry.value.as_usize(),
                 "deepseek2.attention.q_lora_rank" => q_lora_rank = entry.value.as_usize(),
                 "deepseek2.attention.kv_lora_rank" => kv_lora_rank = entry.value.as_usize(),
                 "deepseek2.attention.key_length" => attn_key_length = entry.value.as_usize(),
                 "deepseek2.attention.value_length" => attn_value_length = entry.value.as_usize(),
-                "deepseek2.attention.key_length_mla" => attn_key_length_mla = entry.value.as_usize(),
-                "deepseek2.attention.value_length_mla" => attn_value_length_mla = entry.value.as_usize(),
+                "deepseek2.attention.key_length_mla" => {
+                    attn_key_length_mla = entry.value.as_usize()
+                }
+                "deepseek2.attention.value_length_mla" => {
+                    attn_value_length_mla = entry.value.as_usize()
+                }
                 "deepseek2.expert_feed_forward_length" => expert_ffn_size = entry.value.as_usize(),
                 "deepseek2.expert_count" => n_experts = entry.value.as_usize(),
                 "deepseek2.expert_shared_count" => n_expert_shared = entry.value.as_usize(),
@@ -103,7 +109,7 @@ impl Deepseek2Parser {
                     vec![n_heads; n_layers]
                 } else {
                     vec![n_kv_heads_count; n_layers]
-                }  
+                }
             }
             Some(vec) if vec.len() == n_layers => vec,
             Some(vec) => {
@@ -121,7 +127,9 @@ impl Deepseek2Parser {
         Ok(ModelConfig {
             file_path: PathBuf::from_str(gguf_info.headers.path.as_str())?,
             architecture,
-            model_name: model_name.ok_or_else(|| anyhow::anyhow!("Missing general.name"))?.to_string(),
+            model_name: model_name
+                .ok_or_else(|| anyhow::anyhow!("Missing general.name"))?
+                .to_string(),
             hidden_size: hidden_size.ok_or_else(|| anyhow::anyhow!("Missing embedding_length"))?,
             n_heads,
             n_kv_heads,
@@ -132,7 +140,7 @@ impl Deepseek2Parser {
             rope_theta: rope_theta.ok_or_else(|| anyhow::anyhow!("Missing rope.freq_base"))?,
             max_seq_len: max_seq_len.ok_or_else(|| anyhow::anyhow!("Missing context_length"))?,
             rms_epsilon,
-            cache_seq_len_dim:DeepSeek2ExtraParameters::CACHE_SEQ_LEN_DIM,
+            cache_seq_len_dim: DeepSeek2ExtraParameters::CACHE_SEQ_LEN_DIM,
             conv_l_cache: None,
             n_expert_used,
             n_expert_group,

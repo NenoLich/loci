@@ -1,5 +1,4 @@
 use thiserror::Error;
-use std::path::Path;
 
 pub trait LociContext<T> {
     fn io_ctx(self, ctx: &'static str) -> Result<T, LociError>;
@@ -7,7 +6,10 @@ pub trait LociContext<T> {
 
 impl<T> LociContext<T> for Result<T, std::io::Error> {
     fn io_ctx(self, ctx: &'static str) -> Result<T, LociError> {
-        self.map_err(|e| LociError::IoWithContext { context: ctx, source: e })
+        self.map_err(|e| LociError::IoWithContext {
+            context: ctx,
+            source: e,
+        })
     }
 }
 
@@ -34,7 +36,7 @@ pub enum LociError {
     CacheLoad(String),
 
     #[error("Inference error: {source}")]
-    Inference{
+    Inference {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -83,5 +85,8 @@ pub enum LociError {
     UnknownGgufType(i32),
 
     #[error("Invalid string encoding at offset {offset}: {source}")]
-    InvalidUtf8 { offset: u64, source: std::string::FromUtf8Error },
+    InvalidUtf8 {
+        offset: u64,
+        source: std::string::FromUtf8Error,
+    },
 }

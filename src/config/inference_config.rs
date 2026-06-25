@@ -1,5 +1,5 @@
+use crate::config::{ComputeDtype, InferenceFileConfig};
 use candle_core::DType;
-use crate::config::{ComputeDtype, FileConfig, InferenceFileConfig};
 
 #[derive(Debug, Clone)]
 pub struct InferenceConfig {
@@ -15,7 +15,7 @@ impl Default for InferenceConfig {
             dtype: DType::F16,
             max_seq_len: 32_000,
             flash_attn: true,
-            conv_on_cpu: true 
+            conv_on_cpu: true,
         }
     }
 }
@@ -32,7 +32,7 @@ pub struct InferenceConfigBuilder {
     pub max_seq_len: Option<usize>,
     pub flash_attn: Option<bool>,
     pub conv_on_cpu: Option<bool>,
-    pub file_config: Option<InferenceFileConfig>
+    pub file_config: Option<InferenceFileConfig>,
 }
 
 impl InferenceConfigBuilder {
@@ -44,7 +44,6 @@ impl InferenceConfigBuilder {
             }
         };
         self
-        
     }
 
     pub fn max_seq_len(mut self, max_seq_len: Option<usize>) -> Self {
@@ -70,21 +69,28 @@ impl InferenceConfigBuilder {
     pub fn build(self) -> InferenceConfig {
         let default = InferenceConfig::default();
         InferenceConfig {
-            dtype: self.dtype
-                .or_else(|| self.file_config.as_ref().and_then(|c| 
-                    match c.dtype.as_ref() {
-                        Some(ComputeDtype::F16) => Some(DType::F16),
-                        Some(ComputeDtype::F32) => Some(DType::F32),
-                        _ => None,
-                }))
+            dtype: self
+                .dtype
+                .or_else(|| {
+                    self.file_config
+                        .as_ref()
+                        .and_then(|c| match c.dtype.as_ref() {
+                            Some(ComputeDtype::F16) => Some(DType::F16),
+                            Some(ComputeDtype::F32) => Some(DType::F32),
+                            _ => None,
+                        })
+                })
                 .unwrap_or(default.dtype),
-            max_seq_len: self.max_seq_len
+            max_seq_len: self
+                .max_seq_len
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.max_seq_len))
                 .unwrap_or(default.max_seq_len),
-            flash_attn: self.flash_attn
+            flash_attn: self
+                .flash_attn
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.flash_attn))
                 .unwrap_or(default.flash_attn),
-            conv_on_cpu: self.conv_on_cpu
+            conv_on_cpu: self
+                .conv_on_cpu
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.conv_on_cpu))
                 .unwrap_or(default.conv_on_cpu),
         }

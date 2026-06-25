@@ -41,6 +41,7 @@ impl fmt::Display for GgufType {
     }
 }
 
+#[allow(dead_code)]
 #[derive(FromPrimitive)]
 pub enum GgmlType {
     F32 = 0,
@@ -78,6 +79,7 @@ pub enum GgmlType {
     Count = 40,
 }
 
+#[allow(dead_code)]
 pub struct GgufInfo {
     pub headers: GgufHeaders,
     pub kv_meta: Vec<GgufKVMeta>,
@@ -164,17 +166,6 @@ impl GgufValue {
         }
     }
 
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            GgufValue::Uint8(v) => Some(f64::from(*v)),
-            GgufValue::Uint16(v) => Some(f64::from(*v)),
-            GgufValue::Int16(v) => Some(f64::from(*v)),
-            GgufValue::Float32(v) => Some(f64::from(*v)),
-            GgufValue::Float64(v) => Some(*v),
-            _ => None,
-        }
-    }
-
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             GgufValue::Uint8(v) => Some(u32::from(*v)),
@@ -184,7 +175,7 @@ impl GgufValue {
         }
     }
 
-        pub fn as_i32(&self) -> Option<i32> {
+    pub fn as_i32(&self) -> Option<i32> {
         match self {
             GgufValue::Uint8(v) => Some(i32::from(*v)),
             GgufValue::Uint16(v) => Some(i32::from(*v)),
@@ -229,4 +220,3 @@ impl GgufValue {
         }
     }
 }
-

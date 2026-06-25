@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::gguf::{GgufInfo, GgufKVMeta, GgufValue};
-use crate::config::{ModelConfig, ModelArchitecture}; 
-use crate::inference::ToolFormatStyle;
 use crate::config::parser::build_n_kv_count;
+use crate::config::{ModelArchitecture, ModelConfig};
+use crate::gguf::GgufInfo;
+use crate::inference::ToolFormatStyle;
 
 pub struct Lfm2ExtraParameters;
 
@@ -73,7 +73,7 @@ impl Lfm2Parser {
                     vec![n_heads; n_layers]
                 } else {
                     vec![n_kv_heads_count; n_layers]
-                }  
+                }
             }
             Some(vec) if vec.len() == n_layers => vec,
             Some(vec) => {
@@ -91,7 +91,9 @@ impl Lfm2Parser {
         Ok(ModelConfig {
             file_path: PathBuf::from_str(gguf_info.headers.path.as_str())?,
             architecture,
-            model_name: model_name.ok_or_else(|| anyhow::anyhow!("Missing general.name"))?.to_string(),
+            model_name: model_name
+                .ok_or_else(|| anyhow::anyhow!("Missing general.name"))?
+                .to_string(),
             hidden_size: hidden_size.ok_or_else(|| anyhow::anyhow!("Missing embedding_length"))?,
             n_heads,
             n_kv_heads,

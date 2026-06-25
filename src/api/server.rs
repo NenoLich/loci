@@ -1,33 +1,28 @@
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
+
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
-use tokio::signal;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::config::InferenceConfig;
-use crate::inference::InferenceEngine;
-use std::time::Instant;
-use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
-use crate::api::handlers::{chat_completions, AppState};
+use crate::api::handlers::{AppState, chat_completions};
 use crate::api::worker::WorkerCommand;
 
+use tokio::sync::mpsc::Sender;
+
 pub fn create_router(command_tx: Sender<WorkerCommand>) -> Router {
-    let state = AppState { 
-        command_tx,
-     };
-    
+    let state = AppState { command_tx };
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-    
+
     Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/v1/chat/completions", post(chat_completions))
@@ -36,13 +31,19 @@ pub fn create_router(command_tx: Sender<WorkerCommand>) -> Router {
         .with_state(state)
 }
 
-pub async fn run_server(command_tx: Sender<WorkerCommand>, addr: &str, cancelation_token: CancellationToken) -> anyhow::Result<()> {
+pub async fn run_server(
+    command_tx: Sender<WorkerCommand>,
+    addr: &str,
+    cancelation_token: CancellationToken,
+) -> anyhow::Result<()> {
     let app = create_router(command_tx);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    
+
     let shutdown_trigger = cancelation_token.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("failed to listen for ctrl_c");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl_c");
         shutdown_trigger.cancel();
     });
     let axum_shutdown_token = cancelation_token.clone();

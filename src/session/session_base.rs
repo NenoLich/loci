@@ -2,6 +2,7 @@ use uuid::Uuid;
 
 use crate::types::{ChatMessage, Role};
 
+#[allow(dead_code)]
 pub struct Session {
     pub id: Uuid,
     messages: Vec<ChatMessage>,
@@ -29,11 +30,13 @@ impl Session {
         self.add_message(chat_message);
     }
 
+    #[allow(dead_code)]
     pub fn add_assistant_message(&mut self, message: &str) {
         let chat_message = ChatMessage::new(Role::Assistant, message);
         self.add_message(chat_message);
     }
 
+    #[allow(dead_code)]
     pub fn add_tool_message(&mut self, message: &str) {
         let chat_message = ChatMessage::new(Role::Tool, message);
         self.add_message(chat_message);
