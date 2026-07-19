@@ -1,5 +1,6 @@
 use crate::gguf::{GgufKVMeta, GgufValue};
 
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct TokenizerConfig {
     pub model_type: Option<String>, // from tokenizer.ggml.model
     pub pre_tokenizer_tag: Option<String>,
@@ -39,19 +40,19 @@ impl From<&[GgufKVMeta]> for TokenizerConfig {
         for kv_meta in metadata {
             match kv_meta.key.as_str() {
                 "tokenizer.ggml.hf_json" => {
-                    json_config = kv_meta.value.as_string().map(|v| v.to_string())
+                    json_config = kv_meta.value.as_str().map(|v| v.to_string())
                 }
                 "tokenizer.ggml.model" => {
-                    model_type = kv_meta.value.as_string().map(|v| v.to_string())
+                    model_type = kv_meta.value.as_str().map(|v| v.to_string())
                 }
                 "tokenizer.ggml.pre" => {
-                    pre_tokenizer_tag = kv_meta.value.as_string().map(|v| v.to_string())
+                    pre_tokenizer_tag = kv_meta.value.as_str().map(|v| v.to_string())
                 }
                 "tokenizer.ggml.tokens" => {
                     tokens = kv_meta.value.as_slice().and_then(|slice| {
                         slice
                             .iter()
-                            .filter_map(|v: &GgufValue| v.as_string().map(|v| Some(v.to_string())))
+                            .filter_map(|v: &GgufValue| v.as_str().map(|v| Some(v.to_string())))
                             .collect::<Option<Vec<String>>>()
                     })
                 }
@@ -67,12 +68,12 @@ impl From<&[GgufKVMeta]> for TokenizerConfig {
                     merges = kv_meta.value.as_slice().and_then(|slice| {
                         slice
                             .iter()
-                            .filter_map(|v: &GgufValue| v.as_string().map(|v| Some(v.to_string())))
+                            .filter_map(|v: &GgufValue| v.as_str().map(|v| Some(v.to_string())))
                             .collect::<Option<Vec<String>>>()
                     })
                 }
                 "tokenizer.chat_template" => {
-                    chat_template = kv_meta.value.as_string().map(|v| v.to_string())
+                    chat_template = kv_meta.value.as_str().map(|v| v.to_string())
                 }
                 "tokenizer.ggml.bos_token_id" => bos_token_id = kv_meta.value.as_u32(),
                 "tokenizer.ggml.eos_token_id" => eos_token_id = kv_meta.value.as_u32(),

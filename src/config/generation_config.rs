@@ -3,7 +3,7 @@ use crate::gguf::GgufInfo;
 use crate::types::{ReasoningEffort, ToolChoice, ToolChoiceMode};
 
 /// Generation parameters with priority: CLI > GGUF metadata > defaults
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerationConfig {
     pub max_tokens: usize,
     pub temperature: f32,
@@ -59,7 +59,7 @@ impl GenerationConfig {
         let _architecture = metadata
             .iter()
             .find(|entry| entry.key == "general.architecture")
-            .and_then(|entry| entry.value.as_string())
+            .and_then(|entry| entry.value.as_str())
             .ok_or_else(|| {
                 anyhow::anyhow!("Could not find 'general.architecture' key in gguf metadata")
             })?;
@@ -341,7 +341,7 @@ impl GenerationConfigBuilder {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct GenerationOverrides {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -410,5 +410,381 @@ impl GenerationOverrides {
     pub fn with_file_config(mut self, file_config: Option<GenerationFileConfig>) -> Self {
         self.file_config = file_config;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GenerationFileConfig;
+    use crate::gguf::types::{GgufHeaders, GgufKVMeta, GgufTensorInfo, GgufType, GgufValue};
+    use rstest::rstest;
+
+    #[test]
+    fn test_generation_config_defaults() {
+        let default = GenerationConfig::default();
+        assert_eq!(default.temperature, 0.8);
+        assert_eq!(default.top_p, 0.9);
+        assert_eq!(default.max_tokens, 32_000);
+        assert_eq!(default.repetition_penalty, 1.15);
+        assert_eq!(default.tool_choice, ToolChoice::Mode(ToolChoiceMode::Auto));
+        assert_eq!(default.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(default.stop_tokens, None);
+        assert_eq!(default.logprobs, false);
+        assert_eq!(default.top_logprobs, None);
+        assert_eq!(default.seed, 19);
+    }
+
+    #[rstest]
+    #[case(GgufInfo {
+        headers: GgufHeaders {
+            path: "test_path".to_string(),
+            magic: "GGUF".to_string(),
+            version: 5342,
+            tensor_count: 1,
+            metadata_kv_count: 6,
+        },
+        kv_meta: vec![GgufKVMeta {
+            key: "general.architecture".to_string(),
+            value_type: GgufType::String,
+            value: GgufValue::String("gpt2".to_string()),
+        },
+        GgufKVMeta {
+            key: "sampling.temperature".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(0.87),
+        },
+        GgufKVMeta {
+            key: "sampling.top_p".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(0.99),
+        },
+        GgufKVMeta {
+            key: "general.max_tokens".to_string(),
+            value_type: GgufType::Uint32,
+            value: GgufValue::Uint32(64000),
+        },
+        GgufKVMeta {
+            key: "sampling.repetition_penalty".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(1.158),
+        },
+        GgufKVMeta {
+            key: "unknown.key".to_string(),
+            value_type: GgufType::String,
+            value: GgufValue::String("unknown.key".to_string()),
+        }],
+        tensor_info: vec![GgufTensorInfo {
+            name: "test_tensor_name".to_string(),
+            n_dims: 3,
+            shapes: vec![1, 2, 3],
+            ggml_type: 3,
+            offset: 0,
+        }],
+        tensor_offset_start: 0,
+    },
+    GenerationConfig {
+        temperature: 0.87,
+        top_p: 0.99,
+        max_tokens: 64_000,
+        repetition_penalty: 1.158,
+        tool_choice: ToolChoice::Mode(ToolChoiceMode::Auto),
+        reasoning_effort: ReasoningEffort::High,
+        stop_tokens: None,
+        logprobs: false,
+        top_logprobs: None,
+        seed: 19,
+    })]
+    #[case(GgufInfo {
+        headers: GgufHeaders {
+            path: "test_path".to_string(),
+            magic: "GGUF".to_string(),
+            version: 5342,
+            tensor_count: 1,
+            metadata_kv_count: 6,
+        },
+        kv_meta: vec![GgufKVMeta {
+            key: "general.architecture".to_string(),
+            value_type: GgufType::String,
+            value: GgufValue::String("gpt2".to_string()),
+        },
+        GgufKVMeta {
+            key: "general.sampling.temp".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(0.87),
+        },
+        GgufKVMeta {
+            key: "general.sampling.top_p".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(0.99),
+        },
+        GgufKVMeta {
+            key: "general.max_tokens".to_string(),
+            value_type: GgufType::Uint32,
+            value: GgufValue::Uint32(64000),
+        },
+        GgufKVMeta {
+            key: "general.sampling.repetition_penalty".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(1.158),
+        },
+        GgufKVMeta {
+            key: "unknown.key".to_string(),
+            value_type: GgufType::String,
+            value: GgufValue::String("unknown.key".to_string()),
+        }],
+        tensor_info: vec![GgufTensorInfo {
+            name: "test_tensor_name".to_string(),
+            n_dims: 3,
+            shapes: vec![1, 2, 3],
+            ggml_type: 3,
+            offset: 0,
+        }],
+        tensor_offset_start: 0,
+    },
+    GenerationConfig {
+        temperature: 0.87,
+        top_p: 0.99,
+        max_tokens: 64_000,
+        repetition_penalty: 1.158,
+        tool_choice: ToolChoice::Mode(ToolChoiceMode::Auto),
+        reasoning_effort: ReasoningEffort::High,
+        stop_tokens: None,
+        logprobs: false,
+        top_logprobs: None,
+        seed: 19,
+    })]
+    fn test_generation_config_from_gguf_metadata_success(
+        #[case] gguf_info: GgufInfo,
+        #[case] expected: GenerationConfig,
+    ) {
+        let gen_config = GenerationConfig::from_gguf_metadata(&gguf_info).unwrap();
+        assert_eq!(gen_config, expected);
+    }
+
+    #[rstest]
+    #[case(GgufInfo {
+        headers: GgufHeaders {
+            path: "test_path".to_string(),
+            magic: "GGUF".to_string(),
+            version: 5342,
+            tensor_count: 1,
+            metadata_kv_count: 5,
+        },
+        kv_meta: vec![GgufKVMeta {
+            key: "sampling.temperature".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(0.87),
+        },
+        GgufKVMeta {
+            key: "sampling.top_p".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(0.99),
+        },
+        GgufKVMeta {
+            key: "general.max_tokens".to_string(),
+            value_type: GgufType::Uint32,
+            value: GgufValue::Uint32(64000),
+        },
+        GgufKVMeta {
+            key: "sampling.repetition_penalty".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(1.158),
+        },
+        GgufKVMeta {
+            key: "unknown.key".to_string(),
+            value_type: GgufType::String,
+            value: GgufValue::String("unknown.key".to_string()),
+        }],
+        tensor_info: vec![GgufTensorInfo {
+            name: "test_tensor_name".to_string(),
+            n_dims: 3,
+            shapes: vec![1, 2, 3],
+            ggml_type: 3,
+            offset: 0,
+        }],
+        tensor_offset_start: 0,
+    },
+    "Could not find 'general.architecture' key in gguf metadata")]
+    fn test_generation_config_from_gguf_metadata_failure(
+        #[case] gguf_info: GgufInfo,
+        #[case] expected_error_str: &str,
+    ) {
+        let error = GenerationConfig::from_gguf_metadata(&gguf_info).expect_err(
+            "Expected GenerationConfig validation to fail, but it passed successfully.",
+        );
+        let error_message = error.to_string();
+        assert!(
+            error_message.contains(expected_error_str),
+            "Expected error message to contain '{}', but got '{}'",
+            expected_error_str,
+            error_message
+        );
+    }
+
+    #[test]
+    fn test_generation_config_build_priority() {
+        let builder = setup_test_builder();
+        let gguf_info = setup_test_gguf_info();
+        let config_default = builder.build();
+        assert_eq!(config_default.temperature, 0.8);
+        let builder = setup_test_builder();
+        let file_config = setup_test_file_config();
+        let config_file = builder.with_file_config(Some(file_config)).build();
+        assert_eq!(config_file.temperature, 0.14);
+        let builder = setup_test_builder();
+        let config_gguf = builder.with_gguf_metadata(&gguf_info).unwrap().build();
+        assert_eq!(config_gguf.temperature, 0.24);
+        let builder = setup_test_builder();
+        let file_config = setup_test_file_config();
+        let config_with_file_and_gguf = builder
+            .with_file_config(Some(file_config))
+            .with_gguf_metadata(&gguf_info)
+            .unwrap()
+            .build();
+        assert_eq!(config_with_file_and_gguf.temperature, 0.14);
+        let builder = setup_test_builder();
+        let overrides = setup_test_overrides();
+        let config_overrides = builder.with_overrides(overrides).build();
+        assert_eq!(config_overrides.temperature, 0.34);
+        let builder = setup_test_builder();
+        let file_config = setup_test_file_config();
+        let overrides = setup_test_overrides();
+        let config_file_and_overrides = builder
+            .with_file_config(Some(file_config))
+            .with_overrides(overrides)
+            .build();
+        assert_eq!(config_file_and_overrides.temperature, 0.34);
+        let builder = setup_test_builder();
+        let overrides = setup_test_overrides();
+        let config_gguf_and_overrides = builder
+            .with_gguf_metadata(&gguf_info)
+            .unwrap()
+            .with_overrides(overrides)
+            .build();
+        assert_eq!(config_gguf_and_overrides.temperature, 0.34);
+        let builder = setup_test_builder();
+        let file_config = setup_test_file_config();
+        let overrides = setup_test_overrides();
+        let config_file_gguf_and_overrides = builder
+            .with_file_config(Some(file_config))
+            .with_gguf_metadata(&gguf_info)
+            .unwrap()
+            .with_overrides(overrides)
+            .build();
+        assert_eq!(config_file_gguf_and_overrides.temperature, 0.34);
+        let builder = setup_test_builder();
+        let file_config = setup_test_file_config();
+        let overrides = setup_test_overrides();
+        let config_explicit = builder
+            .with_file_config(Some(file_config))
+            .with_overrides(overrides)
+            .temperature(Some(0.44))
+            .build();
+        assert_eq!(config_explicit.temperature, 0.44);
+    }
+
+    fn setup_test_file_config() -> GenerationFileConfig {
+        GenerationFileConfig {
+            temperature: Some(0.14),
+            top_p: Some(0.49),
+            max_tokens: Some(64_000),
+            repetition_penalty: Some(1.158),
+            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            reasoning_effort: Some(ReasoningEffort::High),
+            stop_tokens: None,
+            logprobs: None,
+            top_logprobs: None,
+            seed: Some(119),
+        }
+    }
+
+    fn setup_test_overrides() -> GenerationOverrides {
+        GenerationOverrides {
+            temperature: Some(0.34),
+            top_p: Some(0.99),
+            max_tokens: Some(64_000),
+            repetition_penalty: Some(1.158),
+            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            reasoning_effort: Some(ReasoningEffort::High),
+            stop_tokens: None,
+            logprobs: None,
+            top_logprobs: None,
+            seed: Some(119),
+            file_config: None,
+        }
+    }
+
+    fn setup_test_builder() -> GenerationConfigBuilder {
+        GenerationConfigBuilder::default()
+    }
+
+    fn setup_test_gguf_info() -> GgufInfo {
+        GgufInfo {
+            headers: GgufHeaders {
+                path: "test_path".to_string(),
+                magic: "GGUF".to_string(),
+                version: 5342,
+                tensor_count: 1,
+                metadata_kv_count: 6,
+            },
+            kv_meta: vec![
+                GgufKVMeta {
+                    key: "general.architecture".to_string(),
+                    value_type: GgufType::String,
+                    value: GgufValue::String("gpt2".to_string()),
+                },
+                GgufKVMeta {
+                    key: "sampling.temperature".to_string(),
+                    value_type: GgufType::Float32,
+                    value: GgufValue::Float32(0.24),
+                },
+                GgufKVMeta {
+                    key: "sampling.top_p".to_string(),
+                    value_type: GgufType::Float32,
+                    value: GgufValue::Float32(0.99),
+                },
+                GgufKVMeta {
+                    key: "general.max_tokens".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(64000),
+                },
+                GgufKVMeta {
+                    key: "sampling.repetition_penalty".to_string(),
+                    value_type: GgufType::Float32,
+                    value: GgufValue::Float32(1.158),
+                },
+                GgufKVMeta {
+                    key: "unknown.key".to_string(),
+                    value_type: GgufType::String,
+                    value: GgufValue::String("unknown.key".to_string()),
+                },
+            ],
+            tensor_info: vec![GgufTensorInfo {
+                name: "test_tensor_name".to_string(),
+                n_dims: 3,
+                shapes: vec![1, 2, 3],
+                ggml_type: 3,
+                offset: 0,
+            }],
+            tensor_offset_start: 0,
+        }
+    }
+
+    #[test]
+    fn test_generation_overrides_chain_calls() {
+        let overrides = GenerationOverrides::default();
+        assert_eq!(overrides.top_p, None);
+        let overrides_with_top_p = overrides.with_top_p(Some(0.49));
+        assert_eq!(overrides_with_top_p.top_p, Some(0.49));
+        let overrides_with_top_p_and_temperature =
+            overrides_with_top_p.with_temperature(Some(0.99));
+        assert_eq!(overrides_with_top_p_and_temperature.top_p, Some(0.49));
+        assert_eq!(overrides_with_top_p_and_temperature.temperature, Some(0.99));
+        let file_config = setup_test_file_config();
+
+        let overrides_with_file_config =
+            overrides_with_top_p_and_temperature.with_file_config(Some(file_config.clone()));
+        assert_eq!(overrides_with_file_config.file_config, Some(file_config));
     }
 }

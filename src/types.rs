@@ -24,7 +24,7 @@ impl Display for Role {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(serialize_with = "serialize_option_string")]
@@ -94,7 +94,7 @@ impl Display for ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -128,7 +128,7 @@ pub struct Function {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionParameters {
     pub r#type: String,
-    pub properties: Option<HashMap<String, Value>>,
+    pub properties: Option<serde_json::Map<String, Value>>,
     pub required: Vec<String>,
 }
 
@@ -161,14 +161,14 @@ pub struct SpecificFunctionChoice {
     pub name: String, // The name of the specific function to force
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct ToolCall {
     pub id: String,
     pub r#type: String,
     pub function: FunctionDefinition,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct FunctionDefinition {
     pub name: String,
     pub arguments: HashMap<String, Value>,
@@ -205,7 +205,7 @@ pub struct CompletionTokensDetails {
     pub rejected_prediction_tokens: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Default)]
 pub struct ChunkToolCall {
     // The index of the tool call in the array
     pub index: u32,
@@ -218,7 +218,7 @@ pub struct ChunkToolCall {
     pub function: ChunkFunctionCall,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Default)]
 pub struct ChunkFunctionCall {
     // Only present on the first chunk initiating the function call
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,7 +232,7 @@ pub struct ChunkLogprob {
     pub content: Vec<LogprobsContent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct LogprobsContent {
     pub token: String,
     pub logprob: f32,
@@ -241,14 +241,14 @@ pub struct LogprobsContent {
     pub top_logprobs: Option<Vec<TopLogprobs>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct TopLogprobs {
     pub token: String,
     pub logprob: f32,
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq)]
 pub enum ModelCacheFragmentation {
     BlockWise { block_size: usize },
     TokenWise,
@@ -300,7 +300,7 @@ impl<'de> Deserialize<'de> for ModelCacheFragmentation {
                 if let Some(rest) = value
                     .strip_prefix("BlockWise(")
                     .and_then(|s| s.strip_suffix(')'))
-                    && let Ok(block_size) = rest.parse::<usize>() 
+                    && let Ok(block_size) = rest.parse::<usize>()
                 {
                     return Ok(ModelCacheFragmentation::BlockWise { block_size });
                 }
@@ -321,5 +321,160 @@ where
     match value {
         Some(v) => serializer.serialize_str(v),
         None => serializer.serialize_str(""),
+    }
+}
+
+#[cfg(test)]
+mod tests_top_level {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(Role::System, "system")]
+    #[case(Role::User, "user")]
+    #[case(Role::Assistant, "assistant")]
+    #[case(Role::Tool, "tool")]
+    fn test_role_display(#[case] role: Role, #[case] expected: &str) {
+        assert_eq!(role.to_string(), expected);
+    }
+
+    #[rstest]
+    #[case(FinishReason::Stop, "stop")]
+    #[case(FinishReason::Length, "length")]
+    #[case(FinishReason::ToolCalls, "tool_calls")]
+    fn test_finish_reason_display(#[case] finish_reason: FinishReason, #[case] expected: &str) {
+        assert_eq!(finish_reason.to_string(), expected);
+    }
+
+    #[rstest]
+    #[case(ReasoningEffort::Low, "low")]
+    #[case(ReasoningEffort::Medium, "medium")]
+    #[case(ReasoningEffort::High, "high")]
+    fn test_reasoning_effort_display(
+        #[case] reasoning_effort: ReasoningEffort,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(reasoning_effort.to_string(), expected);
+    }
+
+    #[rstest]
+    #[case(r#""BlockWise(32)""#, ModelCacheFragmentation::BlockWise { block_size: 32 })]
+    #[case(r#""TokenWise""#, ModelCacheFragmentation::TokenWise)]
+    fn test_fragmentaion_deserialize_success(
+        #[case] fragmentation_str: &str,
+        #[case] expected: ModelCacheFragmentation,
+    ) {
+        let deserialized: ModelCacheFragmentation =
+            serde_json::from_str(fragmentation_str).unwrap();
+        assert_eq!(deserialized, expected);
+    }
+
+    #[rstest]
+    #[case(r#""""#, "invalid fragmentation format: ")]
+    #[case(r#""BlockWise""#, "invalid fragmentation format: BlockWise")]
+    fn test_fragmentaion_deserialize_failure(
+        #[case] fragmentation_str: &str,
+        #[case] expected_msg: &str,
+    ) {
+        let deserialized: Result<ModelCacheFragmentation, _> =
+            serde_json::from_str(fragmentation_str);
+        assert!(deserialized.unwrap_err().to_string().contains(expected_msg));
+    }
+
+    #[rstest]
+    #[case(Role::System, "system")]
+    #[case(Role::User, "user")]
+    #[case(Role::Assistant, "assistant")]
+    #[case(Role::Tool, "tool")]
+    fn test_chat_message_new(#[case] role: Role, #[case] content: &str) {
+        let chat_message = ChatMessage::new(role.clone(), content);
+        assert_eq!(chat_message.role, role);
+        assert_eq!(chat_message.content, Some(content.to_string()));
+        assert_eq!(chat_message.reasoning_content, None);
+        assert_eq!(chat_message.tool_calls, None);
+        assert_eq!(chat_message.tool_call_id, None);
+    }
+
+    #[rstest]
+    #[case(Role::System, "content", "")]
+    #[case(Role::User, "content", "")]
+    #[case(Role::Assistant, "content", "reasoning content")]
+    #[case(Role::Tool, "content", "")]
+    fn test_chat_message_with_reasoning_content(
+        #[case] role: Role,
+        #[case] content: &str,
+        #[case] reasoning_content: &str,
+    ) {
+        let chat_message =
+            ChatMessage::with_reasoning_content(role.clone(), content, reasoning_content);
+        assert_eq!(chat_message.role, role);
+        assert_eq!(chat_message.content, Some(content.to_string()));
+        assert_eq!(
+            chat_message.reasoning_content,
+            Some(reasoning_content.to_string())
+        );
+        assert_eq!(chat_message.tool_calls, None);
+        assert_eq!(chat_message.tool_call_id, None);
+    }
+
+    #[rstest]
+    #[case(Role::System, "content", vec![], None)]
+    #[case(Role::User, "content", vec![], None)]
+    #[case(Role::Assistant, "content", vec![], Some("reasoning content"))]
+    #[case(Role::Assistant, "content", vec![ToolCall {
+        id: "id".to_string(),
+        r#type: "function".to_string(),
+        function: FunctionDefinition {
+            name: "name".to_string(),
+            arguments: HashMap::from([
+                ("arg1".to_string(), serde_json::Value::String("arg1_value".to_string())),
+                ("arg2".to_string(), serde_json::Value::String("arg2_value".to_string())),
+            ])
+        },
+    }], Some("reasoning content"))]
+    fn test_chat_message_with_tool_calls(
+        #[case] role: Role,
+        #[case] content: &str,
+        #[case] tool_calls: Vec<ToolCall>,
+        #[case] reasoning_content: Option<&str>,
+    ) {
+        let chat_message = ChatMessage::with_tool_calls(
+            role.clone(),
+            content,
+            tool_calls.clone(),
+            reasoning_content.clone(),
+        );
+        assert_eq!(chat_message.role, role);
+        assert_eq!(chat_message.content, Some(content.to_string()));
+        assert_eq!(
+            chat_message.reasoning_content,
+            reasoning_content.map(|s| s.to_string())
+        );
+        assert_eq!(chat_message.tool_calls, Some(tool_calls));
+        assert_eq!(chat_message.tool_call_id, None);
+    }
+
+    #[test]
+    fn test_usage_default() {
+        let usage = Usage::default();
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_prompt_token_details_default() {
+        let prompt_token_details = PromptTokensDetails::default();
+        assert_eq!(prompt_token_details.cached_tokens, 0);
+        assert_eq!(prompt_token_details.audio_tokens, 0);
+    }
+
+    #[test]
+    fn test_completion_token_details_default() {
+        let completion_token_details = CompletionTokensDetails::default();
+        assert_eq!(completion_token_details.reasoning_tokens, 0);
+        assert_eq!(completion_token_details.audio_tokens, 0);
+        assert_eq!(completion_token_details.accepted_prediction_tokens, 0);
+        assert_eq!(completion_token_details.rejected_prediction_tokens, 0);
     }
 }

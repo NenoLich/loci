@@ -7,8 +7,9 @@ use crate::config::{Deepseek2Parser, Lfm2Parser};
 use crate::gguf::GgufInfo;
 use crate::inference::ToolFormatStyle;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ModelArchitecture {
+    #[default]
     Lfm2,
     Deepseek2,
 }
@@ -34,7 +35,7 @@ impl fmt::Display for ModelArchitecture {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct ModelConfig {
     pub file_path: PathBuf,
     pub architecture: ModelArchitecture,
@@ -87,7 +88,7 @@ impl ModelConfig {
         let arch_str = gguf_meta
             .iter()
             .find(|&entry| entry.key == "general.architecture")
-            .and_then(|m| m.value.as_string())
+            .and_then(|m| m.value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing general.architecture"))?;
 
         let arch = ModelArchitecture::from_str(arch_str)?;

@@ -40,7 +40,7 @@ impl Lfm2Parser {
         let metadata = &gguf_info.kv_meta;
         for entry in metadata {
             match entry.key.as_str() {
-                "general.name" => model_name = entry.value.as_string(),
+                "general.name" => model_name = entry.value.as_str(),
                 "lfm2.embedding_length" => hidden_size = entry.value.as_usize(),
                 "lfm2.attention.head_count" => n_heads = entry.value.as_usize(),
                 "lfm2.attention.head_count_kv" => n_kv_heads = Some(build_n_kv_count(entry)?),
@@ -136,5 +136,234 @@ impl Lfm2Parser {
             arg_value_open_token_id: None,
             arg_value_close_token_id: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::{GgufHeaders, GgufInfo, GgufKVMeta, GgufTensorInfo, GgufType, GgufValue};
+    use rstest::rstest;
+
+    fn setup_test_gguf_info() -> GgufInfo {
+        GgufInfo {
+            headers: GgufHeaders {
+                path: "test_path".to_string(),
+                magic: "GGUF".to_string(),
+                version: 5342,
+                tensor_count: 1,
+                metadata_kv_count: 6,
+            },
+            kv_meta: vec![
+                GgufKVMeta {
+                    key: "general.name".to_string(),
+                    value_type: GgufType::String,
+                    value: GgufValue::String("test_name".to_string()),
+                },
+                GgufKVMeta {
+                    key: "lfm2.embedding_length".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(512),
+                },
+                GgufKVMeta {
+                    key: "lfm2.feed_forward_length".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(2048),
+                },
+                GgufKVMeta {
+                    key: "lfm2.context_length".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(2048),
+                },
+                GgufKVMeta {
+                    key: "lfm2.vocab_size".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(32000),
+                },
+                GgufKVMeta {
+                    key: "lfm2.rope.freq_base".to_string(),
+                    value_type: GgufType::Float32,
+                    value: GgufValue::Float32(10000.0),
+                },
+                GgufKVMeta {
+                    key: "lfm2.attention.head_count".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(12),
+                },
+                GgufKVMeta {
+                    key: "lfm2.block_count".to_string(),
+                    value_type: GgufType::Uint32,
+                    value: GgufValue::Uint32(2),
+                },
+                GgufKVMeta {
+                    key: "lfm2.attention.head_count_kv".to_string(),
+                    value_type: GgufType::Array,
+                    value: GgufValue::Array(vec![GgufValue::Uint32(12), GgufValue::Uint32(12)]),
+                },
+            ],
+            tensor_info: vec![GgufTensorInfo {
+                name: "test_tensor_name".to_string(),
+                n_dims: 3,
+                shapes: vec![1, 2, 3],
+                ggml_type: 3,
+                offset: 0,
+            }],
+            tensor_offset_start: 0,
+        }
+    }
+
+    fn setup_test_model_config() -> ModelConfig {
+        ModelConfig {
+            file_path: PathBuf::from("test_path"),
+            architecture: ModelArchitecture::Lfm2,
+            model_name: "test_name".to_string(),
+            hidden_size: 512,
+            n_heads: 12,
+            n_kv_heads: vec![12, 12],
+            n_layers: 2,
+            vocab_size: 32000,
+            intermediate_ffn_size: 2048,
+            rope_theta: 10000.0,
+            max_seq_len: 2048,
+            rms_epsilon: 1e-5,
+            cache_seq_len_dim: Lfm2ExtraParameters::CACHE_SEQ_LEN_DIM,
+            supports_reasoning: Lfm2ExtraParameters::SUPPORTS_REASONING,
+            reasoning_start_token_id: Lfm2ExtraParameters::REASONING_START_TOKEN_ID,
+            reasoning_end_token_id: Lfm2ExtraParameters::REASONING_END_TOKEN_ID,
+            supports_tool_calling: Lfm2ExtraParameters::SUPPORTS_TOOL_CALLING,
+            tool_call_start_token_id: Lfm2ExtraParameters::TOOL_CALL_START_TOKEN_ID,
+            tool_call_end_token_id: Lfm2ExtraParameters::TOOL_CALL_END_TOKEN_ID,
+            tool_call_format_style: Lfm2ExtraParameters::TOOL_CALL_FORMAT_STYLE,
+            flatten_tools_to_functions: Lfm2ExtraParameters::FLATTEN_TOOLS_TO_FUNCTIONS,
+            ..Default::default()
+        }
+    }
+
+    #[rstest]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.attention.head_count".to_string());
+        gguf_info
+    },
+    "Missing attention.head_count")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.block_count".to_string());
+        gguf_info
+    },
+    "Missing block_count")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        let n_kv_heads = gguf_info.kv_meta.iter_mut().find(|entry| entry.key == "lfm2.attention.head_count_kv".to_string()).unwrap();
+        n_kv_heads.value = GgufValue::Array(vec![GgufValue::Uint32(12), GgufValue::Uint32(12), GgufValue::Uint32(12)]);
+        gguf_info
+    },
+    "KV heads length 3 does not match layers 2")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "general.name".to_string());
+        gguf_info
+    },
+    "Missing general.name")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.embedding_length".to_string());
+        gguf_info
+    },
+    "Missing embedding_length")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.feed_forward_length".to_string());
+        gguf_info
+    },
+    "Missing feed_forward_length")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.context_length".to_string());
+        gguf_info
+    },
+    "Missing context_length")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.vocab_size".to_string());
+        gguf_info
+    },
+    "Missing vocab_size")]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.rope.freq_base".to_string());
+        gguf_info
+    },
+    "Missing rope.freq_base")]
+    fn test_lfm2_parse_failure(#[case] gguf_info: GgufInfo, #[case] expected_error: &str) {
+        let result = Lfm2Parser::parse(&gguf_info).expect_err("expected parse to fail");
+        assert!(result.to_string().contains(expected_error));
+    }
+
+    #[rstest]
+    #[case(setup_test_gguf_info(), setup_test_model_config())]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.push(GgufKVMeta {
+            key: "lfm2.attention.layer_norm_rms_epsilon".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(1e-3),
+        });
+        gguf_info
+    },
+    {
+        let mut config = setup_test_model_config();
+        config.rms_epsilon = 1e-3;
+        config
+    })]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.push(GgufKVMeta {
+            key: "lfm2.layer_norm_rms_epsilon".to_string(),
+            value_type: GgufType::Float32,
+            value: GgufValue::Float32(1e-3),
+        });
+        gguf_info
+    },
+    {
+        let mut config = setup_test_model_config();
+        config.rms_epsilon = 1e-3;
+        config
+    })]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        let n_kv_heads = gguf_info.kv_meta.iter_mut().find(|entry| entry.key == "lfm2.attention.head_count_kv".to_string()).unwrap();
+        n_kv_heads.value = GgufValue::Array(vec![GgufValue::Uint32(1)]);
+        gguf_info
+    },
+    {
+        let mut config = setup_test_model_config();
+        config.n_kv_heads = vec![config.n_heads; config.n_layers];
+        config
+    })]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        let n_kv_heads = gguf_info.kv_meta.iter_mut().find(|entry| entry.key == "lfm2.attention.head_count_kv".to_string()).unwrap();
+        n_kv_heads.value = GgufValue::Array(vec![GgufValue::Uint32(12)]);
+        gguf_info
+    },
+    {
+        let mut config = setup_test_model_config();
+        config.n_kv_heads = vec![12; config.n_layers];
+        config
+    })]
+    #[case({
+        let mut gguf_info = setup_test_gguf_info();
+        gguf_info.kv_meta.retain(|entry| entry.key != "lfm2.attention.head_count_kv".to_string());
+        gguf_info
+    },
+    {
+        let mut config = setup_test_model_config();
+        config.n_kv_heads = vec![config.n_heads; config.n_layers];
+        config
+    })]
+    fn test_lfm2_parse_success(#[case] gguf_info: GgufInfo, #[case] expected_config: ModelConfig) {
+        let result = Lfm2Parser::parse(&gguf_info).expect("expected parse to succeed");
+        assert_eq!(result, expected_config);
     }
 }

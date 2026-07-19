@@ -1,7 +1,7 @@
 use crate::config::{ComputeDtype, InferenceFileConfig};
 use candle_core::DType;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InferenceConfig {
     pub dtype: DType,
     pub max_seq_len: usize,
@@ -94,5 +94,40 @@ impl InferenceConfigBuilder {
                 .or_else(|| self.file_config.as_ref().and_then(|c| c.conv_on_cpu))
                 .unwrap_or(default.conv_on_cpu),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(DType::F32, 10, true, true)]
+    #[case(DType::F32, 32_000, false, false)]
+    #[case(DType::F32, 1_000_000, true, true)]
+    #[case(DType::F32, 0, true, true)]
+    #[case(DType::F16, 33_000, true, true)]
+    #[case(DType::F16, 32_001, true, true)]
+    #[case(DType::F16, 32_000, false, true)]
+    #[case(DType::F16, 32_000, true, false)]
+    fn test_inference_config(
+        #[case] dtype: DType,
+        #[case] max_seq_len: usize,
+        #[case] flash_attn: bool,
+        #[case] conv_on_cpu: bool,
+    ) {
+        let config = InferenceConfig {
+            dtype,
+            max_seq_len,
+            flash_attn,
+            conv_on_cpu,
+            ..Default::default()
+        };
+
+        assert_eq!(config.dtype, dtype);
+        assert_eq!(config.max_seq_len, max_seq_len);
+        assert_eq!(config.flash_attn, flash_attn);
+        assert_eq!(config.conv_on_cpu, conv_on_cpu);
     }
 }

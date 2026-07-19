@@ -1,6 +1,8 @@
 use candle_core::{DType, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_transformers::quantized_var_builder::VarBuilder;
+#[cfg(any(test, feature = "mock"))]
+use mockall::automock;
 
 use crate::config::{InferenceConfig, ModelArchitecture, ModelConfig};
 use crate::error::LociError;
@@ -14,6 +16,7 @@ pub struct ModelCacheInfo {
     pub n_layers: usize,
 }
 
+#[cfg_attr(any(test, feature = "mock"), automock)]
 pub trait Model {
     fn forward(
         &self,
@@ -59,6 +62,16 @@ pub enum ModelCacheType {
 pub enum MixedCache {
     KvCache(ConcatKvCache),
     ConvCache(Tensor),
+}
+
+impl MixedCache {
+    pub fn as_conv_cache(&self) -> Option<&Tensor> {
+        if let MixedCache::ConvCache(tensor) = self {
+            Some(tensor)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct ModelBuilder {

@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::error::LociError;
 use crate::types::{ModelCacheFragmentation, ReasoningEffort, ToolChoice};
 
-#[derive(Debug, Copy, Clone, clap::ValueEnum, Deserialize)]
+#[derive(Debug, Copy, Clone, clap::ValueEnum, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputeDtype {
     F32,
@@ -21,7 +21,7 @@ impl Display for ComputeDtype {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FileConfig {
     #[serde(rename = "generation_config", alias = "generation")]
     pub generation_config: Option<GenerationFileConfig>,
@@ -40,7 +40,7 @@ impl FileConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct GenerationFileConfig {
     pub temperature: Option<f32>,
     pub max_tokens: Option<usize>,
@@ -54,7 +54,7 @@ pub struct GenerationFileConfig {
     pub seed: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct InferenceFileConfig {
     pub dtype: Option<ComputeDtype>,
     pub max_seq_len: Option<usize>,
@@ -62,7 +62,7 @@ pub struct InferenceFileConfig {
     pub flash_attn: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CacheFileConfig {
     pub prefix_caching: Option<bool>,
     pub cache_dir: Option<String>,

@@ -1,20 +1,24 @@
 use crate::config::GenerationConfig;
 use crate::types::{ToolChoice, ToolChoiceMode};
 use candle_core::Tensor;
+#[cfg(test)]
+use mockall::automock;
 use rand::distr::{Distribution, weighted::WeightedIndex};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplingResult {
     pub token: u32,
     pub logprob: Option<f32>,
     pub top_k_logprobs: Option<Vec<TopKEntry>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopKEntry {
     pub token_id: u32,
     pub logprob: f32,
 }
+
+#[cfg_attr(test, automock)]
 pub trait Sampler {
     fn sample(
         &mut self,
@@ -266,5 +270,258 @@ impl Sampler for InferenceSampler {
 
     fn add_token(&mut self, token_id: u32) {
         self.record_token(token_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn test_greedy_sampling() {
+        let logits = Tensor::from_slice(
+            &[
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.49999, 1.49999, 1.5,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let argmax = logits.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+        let top_k_logprobs = None;
+        let mut sampler = InferenceSampler::new(
+            GenerationConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+        let result = sampler.sample(&logits, top_k_logprobs);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.token, argmax);
+        assert!(result.logprob.is_none());
+        assert!(result.top_k_logprobs.is_none());
+    }
+
+    #[test]
+    fn test_repetition_penalty_clamp() {
+        let sampler = InferenceSampler::new(
+            GenerationConfig {
+                temperature: 0.0,
+                repetition_penalty: 0.5,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+        assert_eq!(sampler.repetition_penalty, 1.0);
+    }
+
+    #[test]
+    fn test_repetition_penalty_affects() {
+        let mut sampler = InferenceSampler::new(
+            GenerationConfig {
+                temperature: 0.0,
+                repetition_penalty: 1.15,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+
+        let logits = Tensor::from_slice(
+            &[
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.49999, 1.49999, 1.5,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let top_k_logprobs = None;
+        let argmax = logits.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+        sampler.record_token(argmax);
+        sampler.record_token(argmax);
+        sampler.record_token(argmax);
+        let result = sampler.sample(&logits, top_k_logprobs);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_ne!(result.token, argmax);
+    }
+
+    #[test]
+    fn test_temperature_scaling() {
+        let logits = Tensor::from_slice(
+            &[
+                0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let top_k_logprobs = Some(3);
+        let mut sampler = InferenceSampler::new(
+            GenerationConfig {
+                temperature: 1.0,
+                top_p: 1.0,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+        let result = sampler.sample(&logits, top_k_logprobs);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let logprob = result.top_k_logprobs.unwrap()[0].logprob;
+        let softmax_logits = candle_nn::ops::softmax(&logits, 0).unwrap();
+        let softmax_argmax = softmax_logits.max(0).unwrap().to_scalar::<f32>().unwrap();
+        let ln_argmax = softmax_argmax.ln();
+        assert!((logprob - ln_argmax) < 0.01);
+    }
+
+    #[test]
+    fn test_same_seed_same_result() {
+        let logits = Tensor::from_slice(
+            &[
+                0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15,
+                0.15,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let top_k_logprobs = None;
+        let mut first_sampler = InferenceSampler::new(
+            GenerationConfig {
+                temperature: 1.0,
+                seed: 42,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+        let result1 = first_sampler.sample(&logits, top_k_logprobs);
+        assert!(result1.is_ok());
+        let result1 = result1.unwrap();
+        let mut second_sampler = InferenceSampler::new(
+            GenerationConfig {
+                temperature: 1.0,
+                seed: 42,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+        let result2 = second_sampler.sample(&logits, top_k_logprobs);
+        assert!(result2.is_ok());
+        let result2 = result2.unwrap();
+        assert_eq!(result1.token, result2.token);
+    }
+
+    #[test]
+    fn test_top_p_apply_effect() {
+        let logits = Tensor::from_slice(
+            &[
+                0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 19.5,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let top_k_logprobs = Some(5);
+        let top_p = 0.8f32;
+        let mut sampler = InferenceSampler::new(
+            GenerationConfig {
+                top_p: top_p,
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            None,
+        );
+        let result = sampler.sample(&logits, top_k_logprobs);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+
+        let top_p_filterred_logprob = result.top_k_logprobs.unwrap()[0];
+        assert!((top_p_filterred_logprob.logprob - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tool_call_ban() {
+        let logits = Tensor::from_slice(
+            &[
+                0.15, 15.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15,
+                0.15, 0.15,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut sampler = InferenceSampler::new(
+            GenerationConfig {
+                tool_choice: ToolChoice::Mode(ToolChoiceMode::None),
+                ..Default::default()
+            },
+            vec![],
+            15,
+            5,
+            Some(1),
+        );
+        let result = sampler.sample(&logits, None);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_ne!(result.token, 1);
+    }
+
+    #[test]
+    fn test_special_token_excluded_from_history() {
+        let mut sampler = InferenceSampler::new(GenerationConfig::default(), vec![1], 15, 5, None);
+
+        let logits = Tensor::from_slice(
+            &[
+                0.15, 15.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15,
+                0.15, 0.15,
+            ],
+            15,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let result = sampler.sample(&logits, None);
+        assert!(result.is_ok());
+        assert!(!sampler.history_window.contains(&1));
+    }
+
+    #[test]
+    fn test_record_token_wraps_around_history_window_circular_buffer() {
+        let mut sampler = InferenceSampler::new(GenerationConfig::default(), vec![], 15, 3, None);
+        sampler.record_token(1);
+        sampler.record_token(2);
+        sampler.record_token(3);
+        sampler.record_token(4);
+        sampler.record_token(5);
+        assert_eq!(sampler.history_window, [4, 5, 3]);
+    }
+
+    #[test]
+    fn test_logits_buffer_and_sort_buffer_sized_to_vocab_size() {
+        let sampler = InferenceSampler::new(GenerationConfig::default(), vec![], 15, 3, None);
+        assert_eq!(sampler.logits_buffer.len(), 15);
+        assert_eq!(sampler.sort_buffer.len(), 15);
     }
 }

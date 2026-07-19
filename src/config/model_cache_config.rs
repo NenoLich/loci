@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::config::CacheFileConfig;
 use crate::types::ModelCacheFragmentation;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelCacheConfig {
     pub prefix_caching: bool,
     pub cache_dir: PathBuf,
@@ -90,11 +90,9 @@ impl ModelCacheConfigBuilder {
             cache_dir: self
                 .cache_dir
                 .or_else(|| {
-                    self.file_config.as_ref().and_then(|c| {
-                        c.cache_dir
-                            .as_ref()
-                            .map(PathBuf::from)
-                    })
+                    self.file_config
+                        .as_ref()
+                        .and_then(|c| c.cache_dir.as_ref().map(PathBuf::from))
                 })
                 .unwrap_or(default.cache_dir),
             max_cache_size: self
@@ -107,5 +105,81 @@ impl ModelCacheConfigBuilder {
                 .unwrap_or(default.min_cache_tokens),
             fragmentation,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[test]
+    fn test_default() {
+        let config = ModelCacheConfig::default();
+        assert_eq!(config.prefix_caching, false);
+        assert_eq!(config.cache_dir, PathBuf::from("model_cache"));
+        assert_eq!(config.max_cache_size, 16_000_000_000);
+        assert_eq!(config.min_cache_tokens, 512);
+        assert_eq!(
+            config.fragmentation,
+            ModelCacheFragmentation::BlockWise { block_size: 32 }
+        );
+    }
+
+    #[rstest]
+    #[case(Some(5), ModelCacheFragmentation::BlockWise { block_size: 5 })]
+    #[case(Some(1), ModelCacheFragmentation::TokenWise)]
+    #[case(None, ModelCacheFragmentation::BlockWise { block_size: 32 })]
+    fn test_fragmentation_resolution(
+        #[case] cache_block_size: Option<usize>,
+        #[case] expected: ModelCacheFragmentation,
+    ) {
+        let config = ModelCacheConfigBuilder::default()
+            .cache_block_size(cache_block_size)
+            .build();
+        assert_eq!(config.fragmentation, expected);
+    }
+
+    #[test]
+    fn test_build_priority() {
+        let config = ModelCacheConfigBuilder::default().build();
+        assert_eq!(
+            config.fragmentation,
+            ModelCacheFragmentation::BlockWise { block_size: 32 }
+        );
+        let config_with_file = ModelCacheConfigBuilder::default()
+            .with_file_config(Some(CacheFileConfig {
+                fragmentation: Some(ModelCacheFragmentation::TokenWise),
+                prefix_caching: Some(true),
+                cache_dir: Some("model_cache".to_string()),
+                max_cache_size: Some(17_000_000_000),
+                min_cache_tokens: Some(258),
+            }))
+            .build();
+        assert_eq!(config_with_file.prefix_caching, true);
+        assert_eq!(
+            config_with_file.fragmentation,
+            ModelCacheFragmentation::TokenWise
+        );
+        let config_with_file_and_explicit = ModelCacheConfigBuilder::default()
+            .with_file_config(Some(CacheFileConfig {
+                fragmentation: Some(ModelCacheFragmentation::TokenWise),
+                prefix_caching: Some(true),
+                cache_dir: Some("model_cache".to_string()),
+                max_cache_size: Some(17_000_000_000),
+                min_cache_tokens: Some(258),
+            }))
+            .min_cache_tokens(Some(64))
+            .cache_dir(Some("explicit_cache_dir"))
+            .prefix_caching(Some(false))
+            .max_cache_size(Some(18_000_000_000))
+            .build();
+        assert_eq!(config_with_file_and_explicit.min_cache_tokens, 64);
+        assert_eq!(
+            config_with_file_and_explicit.cache_dir,
+            PathBuf::from("explicit_cache_dir")
+        );
+        assert_eq!(config_with_file_and_explicit.prefix_caching, false);
+        assert_eq!(config_with_file_and_explicit.max_cache_size, 18_000_000_000);
     }
 }

@@ -2,18 +2,12 @@ use axum::{
     Json,
     extract::State,
     http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::Sse,
-    },
+    response::{IntoResponse, Response, sse::Sse},
 };
 use serde_json::json;
 use tokio::sync::oneshot;
 
-use crate::{
-    api::types::*,
-    api::worker::WorkerCommand,
-};
+use crate::{api::types::*, api::worker::WorkerCommand};
 
 #[derive(Clone)]
 pub struct AppState {

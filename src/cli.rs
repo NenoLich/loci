@@ -1,15 +1,15 @@
 use crate::api::run_server;
 use crate::api::worker::EngineWorker;
 use crate::config::{
-    ComputeDtype, FileConfig, GenerationOverrides, InferenceConfig,
-    InferenceFileConfig, ModelCacheConfig,
+    ComputeDtype, FileConfig, GenerationOverrides, InferenceConfig, InferenceFileConfig,
+    ModelCacheConfig,
 };
 use crate::gguf::Loader;
 use crate::inference::{GenerationContext, InferenceEngine, StreamCallback};
 use crate::session::SessionManager;
 use crate::tokenizer::{Tokenizer, TokenizerService};
 use clap::{Parser, Subcommand};
-use std::{ffi::OsString};
+use std::ffi::OsString;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -228,7 +228,7 @@ pub async fn run() -> anyhow::Result<()> {
 
             println!("🦀 Generating: \"{}\"", prompt);
 
-            let mut session_manager = SessionManager::new();
+            let mut session_manager = SessionManager::default();
             let session = session_manager.start_session(&system_message);
             session.add_user_message(&prompt);
             let prompt_templated = session.get_messages();

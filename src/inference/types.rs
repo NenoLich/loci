@@ -1,8 +1,7 @@
 use crate::error::LociError;
 use crate::inference::{SamplingResult, ToolFormatStyle};
 use crate::types::{
-    ChatMessage, ChunkToolCall, FinishReason, LogprobsContent, Role,
-    ToolCall, Usage,
+    ChatMessage, ChunkToolCall, FinishReason, LogprobsContent, Role, ToolCall, Usage,
 };
 
 use candle_core::Device;
@@ -10,7 +9,7 @@ use candle_core::Device;
 pub type StreamCallback = Box<dyn for<'a> FnMut(StreamFrame<'a>) -> Result<(), LociError>>;
 
 /// Events emitted by supervisors during token processing
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GenerationEvent {
     /// No event
     None,
@@ -44,6 +43,7 @@ pub enum GenerationDataType {
     ToolCallArguments,
 }
 
+#[derive(Debug, Clone)]
 pub struct StreamFrame<'a> {
     pub output: &'a str,
     pub tool_call_chunk: Option<ChunkToolCall>,
@@ -93,6 +93,7 @@ impl GenerationReport {
     }
 }
 
+#[derive(Default)]
 pub struct PostSamplingConfig {
     pub tool_call_start_token_id: Option<u32>,
     pub tool_call_end_token_id: Option<u32>,

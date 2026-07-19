@@ -8,8 +8,6 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 
 #[cfg(feature = "cuda")]
 use candle_flash_attn::flash_attn;
-
-use nvtx::{range_pop, range_push};
 use once_cell::sync::OnceCell;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
@@ -17,10 +15,11 @@ use tracing::{debug, trace_span};
 
 use crate::config::ModelConfig;
 use crate::model::utility::{
-    RotaryEmbedding, find_norm_prefix, get_mask, get_tensor, qmatmul_forward,
-    repeat_kv, update_cache,
+    RotaryEmbedding, find_norm_prefix, get_mask, get_tensor, qmatmul_forward, repeat_kv,
+    update_cache,
 };
 use crate::model::{MixedCache, Model};
+use crate::profiling;
 
 pub struct Deepseek2Model {
     embed_layer: Embedding,
@@ -176,10 +175,10 @@ impl Deepseek2Attn {
         let k_states = k_states.contiguous()?;
         let v_states = v_states.contiguous()?;
 
-        range_push!("Compute attn");
+        profiling::range_push!("Compute attn");
         let attn =
             self.compute_attention(q_states, k_states, v_states, compute_dtype, use_flash)?;
-        range_pop!();
+        profiling::range_pop!();
 
         // Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
         let attn = attn
@@ -513,15 +512,15 @@ impl Model for Deepseek2Model {
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         // 1. Token embeddings
-        range_push!("Embed step");
+        profiling::range_push!("Embed step");
         let mut x = self
             .embed_layer
             .forward(input)?
             .to_dtype(self.compute_dtype)?;
-        range_pop!();
+        profiling::range_pop!();
 
         // 2. Transformer layers
-        range_push!("Layer step");
+        profiling::range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_span = trace_span!("layer", layer = i);
             x = layer_span.in_scope(|| {
@@ -534,7 +533,7 @@ impl Model for Deepseek2Model {
                 )
             })?;
         }
-        range_pop!();
+        profiling::range_pop!();
 
         // 3. Final normalization and output projection
         let x_contiguous = x.to_dtype(DType::F32)?;
@@ -560,7 +559,7 @@ impl Deepseek2Model {
         compute_dtype: DType,
         requested_max_seq_len: usize,
     ) -> anyhow::Result<Self> {
-        range_push!("Deepseek2Model loading");
+        profiling::range_push!("Deepseek2Model loading");
         debug!("Deepseek2 model load started...");
         let device = var_builder.device();
         let hidden_size = config.hidden_size;
@@ -615,7 +614,7 @@ impl Deepseek2Model {
             })
             .collect::<anyhow::Result<Vec<Deepseek2Layer>>>()?;
         debug!("Layers loaded");
-        range_pop!();
+        profiling::range_pop!();
         Ok(Self {
             embed_layer,
             layers,

@@ -188,7 +188,7 @@ fn run_stream_generation(
     req: ValidatedChatCompletionRequest,
     stream_tx: Sender<Result<Event, Infallible>>,
     cancellation_token: CancellationToken,
-    ) {
+) {
     let overrides = GenerationOverrides::default()
         .with_temperature(req.temperature)
         .with_top_p(req.top_p)
@@ -215,7 +215,7 @@ fn run_stream_generation(
 
     let initial_chunk = build_initial_chunk(static_data.clone());
     if let Ok(event) = Event::default().json_data(initial_chunk)
-        && stream_tx.try_send(Ok(event)).is_err() 
+        && stream_tx.try_send(Ok(event)).is_err()
     {
         // The client disconnected (closed browser tab)
         info!("User disconnected. Stopping generation.");
@@ -267,7 +267,7 @@ fn run_stream_generation(
             let final_content_chunk =
                 build_final_content_chunk(static_data.clone(), report.finish_reason.clone());
             if let Ok(final_chunk_event) = Event::default().json_data(final_content_chunk)
-                && stream_tx.try_send(Ok(final_chunk_event)).is_err() 
+                && stream_tx.try_send(Ok(final_chunk_event)).is_err()
             {
                 // The client disconnected (closed browser tab)
                 info!("User disconnected. Stopping generation.");
@@ -276,7 +276,7 @@ fn run_stream_generation(
             if matches!(req.stream_options, Some(options) if options.include_usage == Some(true)) {
                 let usage_chunk = build_usage_chunk(static_data.clone(), report);
                 if let Ok(usage_chunk_event) = Event::default().json_data(usage_chunk)
-                    && stream_tx.try_send(Ok(usage_chunk_event)).is_err() 
+                    && stream_tx.try_send(Ok(usage_chunk_event)).is_err()
                 {
                     // The client disconnected (closed browser tab)
                     info!("User disconnected. Stopping generation.");
@@ -297,7 +297,7 @@ fn run_stream_generation(
                     }
                 });
                 if let Ok(event) = Event::default().json_data(json_error)
-                    && stream_tx.try_send(Ok(event)).is_err() 
+                    && stream_tx.try_send(Ok(event)).is_err()
                 {
                     // The client disconnected (closed browser tab)
                     info!("User disconnected. Stopping generation.");
@@ -491,7 +491,7 @@ fn run_single_generation(
                     }
                 });
                 if let Ok(event) = Event::default().json_data(json_error)
-                    && stream_tx.try_send(Ok(event)).is_err() 
+                    && stream_tx.try_send(Ok(event)).is_err()
                 {
                     // The client disconnected (closed browser tab)
                     info!("User disconnected. Stopping generation.");
@@ -518,5 +518,460 @@ fn build_chat_completion_response(model: &str, report: GenerationReport) -> Chat
         system_fingerprint: format!("loci-{}", model),
         choices,
         usage: Some(report.usage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        ChatMessage, ChunkFunctionCall, ChunkToolCall, CompletionTokensDetails,
+        PromptTokensDetails, Usage, ModelCacheFragmentation
+    };
+    use insta::assert_json_snapshot;
+    use candle_core::Device;
+
+    use crate::tokenizer::MockTokenizer;
+    use crate::model::model_base::{MockModel, ModelCacheType};
+    use crate::inference::PostSamplingConfig;
+    use crate::config::GenerationConfig;
+    use crate::inference::model_cache::{MockCacheLoader, MockModelCacheManagerInterface};
+
+    fn mock_static_chat_completions_data() -> StaticChatCompletionData {
+        StaticChatCompletionData {
+            id: "1234".to_string(),
+            created: 1234567u64,
+            model: "test".to_string(),
+            system_fingerprint: "loci-test".to_string(),
+        }
+    }
+
+    fn mock_generation_report() -> GenerationReport {
+        GenerationReport {
+            chat_message: ChatMessage {
+                role: Role::Assistant,
+                content: Some("content".to_string()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            finish_reason: FinishReason::Length,
+            usage: Usage {
+                prompt_tokens: 51,
+                completion_tokens: 79,
+                total_tokens: 130,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: 0,
+                    audio_tokens: 0,
+                }),
+                completion_tokens_details: Some(CompletionTokensDetails::default()),
+            },
+            token_generation_sec: 2.0,
+        }
+    }
+
+    #[test]
+    fn test_build_initial_chunk() {
+        let data = mock_static_chat_completions_data();
+        let response = build_initial_chunk(data);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              }
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_regular_chunk_with_direct_content() {
+        let data = mock_static_chat_completions_data();
+        let frame_data = StreamFrame {
+            output: "content",
+            output_type: GenerationDataType::DirectContent,
+            tool_call_chunk: None,
+            logprobs: None,
+        };
+        let response = build_regular_chunk(data, frame_data);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "content"
+              }
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_regular_chunk_with_reasoning() {
+        let data = mock_static_chat_completions_data();
+        let frame_data = StreamFrame {
+            output: "content",
+            output_type: GenerationDataType::Reasoning,
+            tool_call_chunk: None,
+            logprobs: None,
+        };
+        let response = build_regular_chunk(data, frame_data);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "content"
+              }
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_regular_chunk_with_tool_call_name() {
+        let data = mock_static_chat_completions_data();
+        let frame_data = StreamFrame {
+            output: "",
+            output_type: GenerationDataType::ToolCallName,
+            tool_call_chunk: Some(ChunkToolCall {
+                index: 0,
+                id: Some(String::from("4321")),
+                r#type: Some(String::from("function")),
+                function: ChunkFunctionCall {
+                    name: Some(String::from("test_tool")),
+                    arguments: String::new(),
+                },
+            }),
+            logprobs: None,
+        };
+        let response = build_regular_chunk(data, frame_data);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "id": "4321",
+                    "type": "function",
+                    "function": {
+                      "name": "test_tool",
+                      "arguments": ""
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_regular_chunk_with_tool_call_arguments() {
+        let data = mock_static_chat_completions_data();
+        let frame_data = StreamFrame {
+            output: "",
+            output_type: GenerationDataType::ToolCallArguments,
+            tool_call_chunk: Some(ChunkToolCall {
+                index: 0,
+                id: None,
+                r#type: None,
+                function: ChunkFunctionCall {
+                    name: None,
+                    arguments: String::from("[\"arg1\", \"arg2\"]"),
+                },
+            }),
+            logprobs: None,
+        };
+        let response = build_regular_chunk(data, frame_data);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "[\"arg1\", \"arg2\"]"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_final_content_chunk_with_finish_reason_stop() {
+        let data = mock_static_chat_completions_data();
+        let response = build_final_content_chunk(data, FinishReason::Stop);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_final_content_chunk_with_finish_reason_length() {
+        let data = mock_static_chat_completions_data();
+        let response = build_final_content_chunk(data, FinishReason::Length);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "length"
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_final_content_chunk_with_finish_reason_tool_calls() {
+        let data = mock_static_chat_completions_data();
+        let response = build_final_content_chunk(data, FinishReason::ToolCalls);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": null
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_usage_chunk() {
+        let data = mock_static_chat_completions_data();
+        let report = mock_generation_report();
+
+        let response = build_usage_chunk(data, report);
+
+        assert_json_snapshot!(response, @r#"
+        {
+          "id": "1234",
+          "object": "chat.completion.chunk",
+          "created": 1234567,
+          "model": "test",
+          "system_fingerprint": "loci-test",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 79,
+            "total_tokens": 130,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "audio_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "audio_tokens": 0,
+              "accepted_prediction_tokens": 0,
+              "rejected_prediction_tokens": 0
+            }
+          }
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_build_chat_completion_response() {
+        let report = mock_generation_report();
+        let response = build_chat_completion_response("test-model", report);
+        let mut value = serde_json::to_value(&response).unwrap();
+        value.as_object_mut().unwrap().remove("id");
+        value.as_object_mut().unwrap().remove("created");
+        assert_json_snapshot!(value, @r#"
+        {
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 79,
+            "total_tokens": 130,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "audio_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "audio_tokens": 0,
+              "accepted_prediction_tokens": 0,
+              "rejected_prediction_tokens": 0
+            }
+          },
+          "object": "chat.completion",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "content"
+              },
+              "finish_reason": "length"
+            }
+          ],
+          "model": "test-model",
+          "system_fingerprint": "loci-test-model"
+        }
+        "#);
+    }
+
+    #[tokio::test]
+    async fn test_drop_engine_due_to_timeout() {
+        tokio::time::pause();
+
+        let inference_config = InferenceConfig::default();
+        let model_cache_config = ModelCacheConfig::default();
+        let tokenizer = Box::new(MockTokenizer::new());
+        let model = Box::new(MockModel::new());
+        let post_sampling_config = PostSamplingConfig::default();
+        let gen_builder = GenerationConfig::builder();
+        let active_engine = Arc::new(InferenceEngine {
+            tokenizer,
+            model,
+            device: Device::Cpu,
+            model_name: "mock".to_string(),
+            vocab_size: 100,
+            flash_attn: false,
+            supports_reasoning: false,
+            supports_tool_calling: false,
+            flatten_tools_to_functions: true,
+            post_sampling_config,
+            gen_builder,
+        });
+        let generation_context = GenerationContext {
+            model: "mock".to_string(),
+            token_ids: vec![],
+            active_cache: vec![],
+            model_layers_count: 2,
+            model_cache_seq_len_dim: 2,
+            model_cache_fragmentation: ModelCacheFragmentation::TokenWise,
+            block_boundary_conv_cache: vec![],
+            prefix_caching: false,
+            cache_type: ModelCacheType::FullAttn,
+            cache_manager: Box::new(MockModelCacheManagerInterface::new()),
+            cache_loader: Box::new(MockCacheLoader::new()),
+            cache_metadata: vec![],
+        };
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+
+        let mut worker = EngineWorker {
+            inference_config,
+            model_cache_config,
+            active_engine: Some(active_engine),
+            generation_context: Some(generation_context),
+            command_rx,
+            idle_timeout: Duration::from_secs(600),
+            cancellation_token: CancellationToken::new(),
+        };
+
+        assert!(worker.active_engine.is_some());
+        assert!(worker.generation_context.is_some());
+
+        // Simulate what run() does: record timestamp, then sleep inside select.
+        let last_used = Instant::now();
+
+        // Fast-forward past the idle timeout + one sleep cycle.
+        tokio::time::advance(Duration::from_secs(630)).await;
+
+        // Simulate one iteration of the select loop in run().
+        let timer = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(timer);
+        tokio::select! {
+            biased;
+            _ = timer.as_mut() => {
+                if worker.active_engine.is_some() && last_used.elapsed() > worker.idle_timeout {
+                    worker.drop_engine_and_ctx();
+                }
+            }
+            _ = worker.command_rx.recv() => {}
+        }
+
+        assert!(worker.active_engine.is_none());
+        assert!(worker.generation_context.is_none());
     }
 }

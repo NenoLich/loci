@@ -9,16 +9,15 @@ use candle_nn::{
 };
 use candle_transformers::quantized_nn::{Embedding, RmsNorm};
 use candle_transformers::quantized_var_builder::VarBuilder;
-use nvtx::{range_pop, range_push};
 use once_cell::sync::OnceCell;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 use tracing::trace_span;
 
 use crate::model::utility::{
-    RotaryEmbedding, find_norm_prefix, get_mask, qmatmul_forward, repeat_kv,
-    update_cache,
+    RotaryEmbedding, find_norm_prefix, get_mask, qmatmul_forward, repeat_kv, update_cache,
 };
+use crate::profiling;
 use crate::{
     config::ModelConfig,
     model::{MixedCache, Model, ModelCacheType},
@@ -189,9 +188,9 @@ impl AttentionMixer {
         // 4. Update KV cache and compute attention
         let (k, v) = update_cache(k, v, cache)?;
 
-        range_push!("Compute attn");
+        profiling::range_push!("Compute attn");
         let y = self.compute_attention(q, k, v, compute_dtype, use_flash)?;
-        range_pop!();
+        profiling::range_pop!();
 
         // 5. Reshape and project output: [B, S, H, D] -> [B, S, hidden_size]
         let y = y.reshape((batch_size, seq_len, self.head_dim * self.n_heads))?;
@@ -382,7 +381,7 @@ impl ShortConvMixer {
         seq_len: usize,
         hidden_size: usize,
     ) -> anyhow::Result<Tensor> {
-        range_push!("Conv forward (cache and forward)");
+        profiling::range_push!("Conv forward (cache and forward)");
 
         // Optionally move to CPU for convolution
         let original_device = input.device().clone();
@@ -406,7 +405,7 @@ impl ShortConvMixer {
         } else {
             conv_out
         };
-        range_pop!();
+        profiling::range_pop!();
         Ok(output)
     }
 
@@ -569,14 +568,14 @@ impl Model for Lfm2Model {
         use_flash: bool,
     ) -> anyhow::Result<Tensor> {
         // 1. Token embeddings
-        range_push!("Embed step");
+        profiling::range_push!("Embed step");
         let mut x = self
             .embed_layer
             .forward(input)?
             .to_dtype(self.compute_dtype)?;
-        range_pop!();
+        profiling::range_pop!();
         // 2. Transformer layers
-        range_push!("Layer step");
+        profiling::range_push!("Layer step");
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_span = trace_span!("layer", layer = i);
             x = layer_span.in_scope(|| {
@@ -589,7 +588,7 @@ impl Model for Lfm2Model {
                 )
             })?;
         }
-        range_pop!();
+        profiling::range_pop!();
 
         // 3. Final normalization and output projection
         let final_norm = self.embed_norm.forward(&x.to_dtype(DType::F32)?)?;
@@ -660,7 +659,7 @@ impl Lfm2Model {
         requested_max_seq_len: usize,
         conv_on_cpu: bool,
     ) -> anyhow::Result<Self> {
-        range_push!("Lfm2Model loading");
+        profiling::range_push!("Lfm2Model loading");
 
         let rms_epsilon = config.rms_epsilon as f64;
         let hidden_size = config.hidden_size;
@@ -727,7 +726,7 @@ impl Lfm2Model {
             })
             .max()
             .unwrap_or(1);
-        range_pop!();
+        profiling::range_pop!();
 
         Ok(Self {
             embed_layer,

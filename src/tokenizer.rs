@@ -1,5 +1,6 @@
 use ahash::AHashMap;
-
+#[cfg(any(test, feature = "mock"))]
+use mockall::automock;
 use regex::Regex;
 use serde_json::ser::Formatter;
 use std::collections::BTreeSet;
@@ -19,19 +20,6 @@ use tokenizers::pre_tokenizers::{PreTokenizerWrapper, byte_level::ByteLevel, spl
 use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::{AddedToken, Tokenizer as RawTokenizer};
 use tracing::debug;
-
-pub struct TokenizerDefaults;
-
-impl TokenizerDefaults {
-    pub const CHAT_TEMPLATE: &'static str =
-        "{% for message in messages %}{{ message.content }}{% endfor %}";
-    pub const BOS_TOKEN_ID: u32 = 1;
-    pub const EOS_TOKEN_ID: u32 = 2;
-    pub const UNKNOWN_TOKEN_ID: u32 = 0;
-    pub const PADDING_TOKEN_ID: u32 = 2;
-    pub const EOT_TOKEN_ID: u32 = 2;
-    pub const EOM_TOKEN_ID: u32 = 2;
-}
 
 /// Minimal streaming context for incremental token-to-text decoding.
 /// Accumulates tokens until a complete UTF-8 sequence is decodable, then clears.
@@ -98,6 +86,7 @@ impl Formatter for SpacedFormatter {
     }
 }
 
+#[cfg_attr(any(test, feature = "mock"), automock)]
 pub trait Tokenizer {
     fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, LociError>;
     fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String, LociError>;
@@ -359,7 +348,7 @@ impl Tokenizer for Box<dyn Tokenizer + Send + Sync + '_> {
 
 impl TokenizerService {
     pub fn builder() -> TokenizerServiceBuilder {
-        TokenizerServiceBuilder::new()
+        TokenizerServiceBuilder::default()
     }
 }
 
@@ -383,28 +372,30 @@ pub struct TokenizerServiceBuilder {
     tojson_kwarg_re: Option<Regex>,
 }
 
-impl TokenizerServiceBuilder {
-    pub fn new() -> Self {
+impl Default for TokenizerServiceBuilder {
+    fn default() -> Self {
         // Matches .get('key') or .get("key") including variations in spacing
-        let python_get_pattern = Regex::new("\\.get\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)").ok();
+        let python_get_pattern = Regex::new("\\.get\\(\\s*(['\"])([^'\"]+)['\"]\\s*\\)").ok();
         // Matches ensure_ascii kwarg in tojson() calls (e.g., tojson(x, ensure_ascii=False))
-        let tojson_kwarg_re =
-            Regex::new(r"(?:,\s*)?ensure_ascii\s*=\s*(?:True|False)(?:\s*,)?").ok();
+        let tojson_kwarg_re = Regex::new(r"(?:,\s*)?ensure_ascii\s*=\s*(?:True|False)").ok();
 
         Self {
-            chat_template: TokenizerDefaults::CHAT_TEMPLATE.into(),
-            bos_token_id: TokenizerDefaults::BOS_TOKEN_ID,
-            eos_token_id: TokenizerDefaults::EOS_TOKEN_ID,
-            eot_token_id: TokenizerDefaults::EOT_TOKEN_ID,
-            eom_token_id: TokenizerDefaults::EOM_TOKEN_ID,
-            unknown_token_id: TokenizerDefaults::UNKNOWN_TOKEN_ID,
-            padding_token_id: TokenizerDefaults::PADDING_TOKEN_ID,
+            chat_template: "{% for message in messages %}{{ message.content }}{% endfor %}"
+                .to_string(),
+            bos_token_id: 1,
+            eos_token_id: 2,
+            eot_token_id: 2,
+            eom_token_id: 2,
+            unknown_token_id: 0,
+            padding_token_id: 2,
             config: None,
             python_get_pattern,
             tojson_kwarg_re,
         }
     }
+}
 
+impl TokenizerServiceBuilder {
     pub fn with_gguf_metadata(mut self, info: &GgufInfo) -> Self {
         let metadata = info.kv_meta.as_slice();
         self.config = Some(TokenizerConfig::from(metadata));
@@ -563,7 +554,8 @@ impl TokenizerServiceBuilder {
             tokenizer.add_special_tokens(&special_added_tokens);
         }
 
-        self.set_post_processor(&mut tokenizer, config, special_tokens)?;
+        let template_processing = self.set_post_processor(config, special_tokens)?;
+        tokenizer.with_post_processor(template_processing);
 
         Ok(tokenizer)
     }
@@ -625,10 +617,9 @@ impl TokenizerServiceBuilder {
 
     fn set_post_processor(
         &self,
-        tokenizer: &mut RawTokenizer,
         config: &TokenizerConfig,
         special_tokens: Vec<(String, u32)>,
-    ) -> Result<(), LociError> {
+    ) -> Result<Option<TemplateProcessing>, LociError> {
         let mut template = "$A:0".to_string();
         if config.add_bos {
             let (bos_token_str, _) = special_tokens
@@ -666,8 +657,7 @@ impl TokenizerServiceBuilder {
                 reason: format!("failed to build post processor: {}", e),
             });
 
-        tokenizer.with_post_processor(processor.ok());
-        Ok(())
+        Ok(processor.ok())
     }
 
     fn clean_chat_template(&self, template: Option<&str>) -> Option<String> {
@@ -676,9 +666,7 @@ impl TokenizerServiceBuilder {
         let name = "chat_check";
 
         // Step 1: Always try to compile and immediately test-render it
-        if env.add_template(name, template).is_ok()
-            && let Ok(tmpl) = env.get_template(name)
-        {
+        if let (Ok(()), Ok(tmpl)) = (env.add_template(name, template), env.get_template(name)) {
             // We must mock a render to see if it actually executes without errors
             let mock_messages = [
                 ChatMessage {
@@ -753,7 +741,11 @@ impl TokenizerServiceBuilder {
     fn fix_python_code(&self, template: &str) -> Option<String> {
         // Converts .get('tool_calls') into ['tool_calls']
         Some(if let Some(ref pattern) = self.python_get_pattern {
-            pattern.replace_all(template, "[$1$2$1]").into_owned()
+            pattern
+                .replace_all(template, |caps: &regex::Captures<'_>| {
+                    format!("[{}{}{}]", &caps[1], &caps[2], &caps[1])
+                })
+                .into_owned()
         } else {
             template.to_string()
         })
@@ -765,10 +757,442 @@ impl TokenizerServiceBuilder {
             let result = pattern.replace_all(template, "").into_owned();
             // Clean up any artifacts from kwarg removal
             let result = result.replace(", ,", ",");
+            let result = result.replace(",,", ",");
             let result = result.replace("(, ", "(");
+            let result = result.replace("( ", "(");
             Some(result.replace(", )", ")"))
         } else {
             Some(template.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(12)]
+    #[case(0)]
+    fn test_stream_context_with_capacity(#[case] capacity: usize) {
+        let ctx = StreamContext::with_capacity(capacity);
+        assert!(ctx.ids.is_empty());
+        assert_eq!(ctx.prefix, "");
+        assert_eq!(ctx.prefix_index, 0);
+    }
+
+    #[test]
+    fn test_stream_context_reset() {
+        let mut ctx = StreamContext::with_capacity(12);
+        ctx.ids = vec![1, 2, 3];
+        ctx.prefix = "hello".to_string();
+        ctx.prefix_index = 1;
+        ctx.reset();
+        assert!(ctx.ids.is_empty());
+        assert_eq!(ctx.prefix, "");
+        assert_eq!(ctx.prefix_index, 0);
+    }
+
+    // --- clean_chat_template ---
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some("".to_string()), Some("".to_string()))]
+    #[case(Some("{{ messages }}".to_string()), Some("{{ messages }}".to_string()))]
+    #[case(Some("{% if %}".to_string()), None)]
+    fn test_clean_chat_template(
+        #[case] template: Option<String>,
+        #[case] expected: Option<String>,
+    ) {
+        let builder = TokenizerServiceBuilder::default();
+        let result = builder.clean_chat_template(template.as_deref());
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case("{{ messages.get('tool_calls') }}", "{{ messages['tool_calls'] }}")]
+    #[case("{{ messages.get(\"tool_calls\") }}", "{{ messages[\"tool_calls\"] }}")]
+    #[case("{{ messages.get('a') }}", "{{ messages['a'] }}")]
+    #[case("no get here", "no get here")]
+    fn test_clean_chat_template_fix_python_code(#[case] template: &str, #[case] expected: &str) {
+        let builder = TokenizerServiceBuilder::default();
+        let result = builder.clean_chat_template(Some(template));
+        assert_eq!(result, Some(expected.to_string()));
+    }
+
+    #[test]
+    fn test_clean_chat_template_fix_tojson_kwargs() {
+        let builder = TokenizerServiceBuilder::default();
+        let result =
+            builder.clean_chat_template(Some("{{ messages | tojson(ensure_ascii=False) }}"));
+        assert_eq!(result, Some("{{ messages | tojson() }}".to_string()));
+    }
+
+    // --- fix_python_code (direct) ---
+
+    #[rstest]
+    #[case("{{ messages.get('') }}", "{{ messages.get('') }}")]
+    #[case("{{ messages.get('tool_calls') }}", "{{ messages['tool_calls'] }}")]
+    #[case(
+        "{{ messages.get('tool_calls'), messages.get('tools') }}",
+        "{{ messages['tool_calls'], messages['tools'] }}"
+    )]
+    #[case("{{ messages.get(\"tool_calls\") }}", "{{ messages[\"tool_calls\"] }}")]
+    #[case("{{ messages.get( 'key' ) }}", "{{ messages['key'] }}")]
+    #[case("no get", "no get")]
+    #[case("", "")]
+    fn test_fix_python_code(#[case] template: &str, #[case] expected: &str) {
+        let builder = TokenizerServiceBuilder::default();
+        assert_eq!(
+            builder.fix_python_code(template),
+            Some(expected.to_string())
+        );
+    }
+
+    // --- fix_tojson_kwargs (direct) ---
+
+    #[rstest]
+    #[case("{{ x | tojson(ensure_ascii=False) }}", "{{ x | tojson() }}")]
+    #[case("{{ x | tojson(ensure_ascii=True) }}", "{{ x | tojson() }}")]
+    #[case(
+        "{{ x | tojson(ensure_ascii=True, indent=2) }}",
+        "{{ x | tojson(indent=2) }}"
+    )]
+    #[case(
+        "{{ x | tojson(indent=2, ensure_ascii=False) }}",
+        "{{ x | tojson(indent=2) }}"
+    )]
+    #[case(
+        "{{ x | tojson(indent=2, ensure_ascii=False, sort_keys=True) }}",
+        "{{ x | tojson(indent=2, sort_keys=True) }}"
+    )]
+    #[case("no tojson", "no tojson")]
+    #[case("", "")]
+    fn test_fix_tojson_kwargs(#[case] template: &str, #[case] expected: &str) {
+        let builder = TokenizerServiceBuilder::default();
+        assert_eq!(
+            builder.fix_tojson_kwargs(template),
+            expected.to_string().into()
+        );
+    }
+
+    #[rstest]
+    #[case(serde_json::to_value(Function {
+        name: "foo".to_string(),
+        description: Some("bar".to_string()),
+        parameters: FunctionParameters {
+            r#type: "object".to_string(),
+            properties: Some(
+                [].into_iter().collect(),
+            ),
+            required: vec![],
+        },
+        }).expect("to_value"),
+        r#"{"name": "foo", "description": "bar", "parameters": {"type": "object", "properties": {}, "required": []}}"#
+    )]
+    #[case(serde_json::to_value(Function {
+        name: "foo".to_string(),
+        description: Some("bar".to_string()),
+        parameters: FunctionParameters {
+            r#type: "object".to_string(),
+            properties: Some(
+                [("key".to_string(), serde_json::json!(1))].into_iter().collect(),
+            ),
+            required: vec![],
+        },
+        }).expect("to_value"),
+        r#"{"name": "foo", "description": "bar", "parameters": {"type": "object", "properties": {"key": 1}, "required": []}}"#
+    )]
+    #[case(serde_json::to_value(Function {
+        name: "foo".to_string(),
+        description: None,
+        parameters: FunctionParameters {
+            r#type: "object".to_string(),
+            properties: Some(
+                [
+                    ("key1".to_string(), serde_json::json!(1)),
+                    ("key2".to_string(), serde_json::json!(2)),
+                ].into_iter().collect(),
+            ),
+            required: vec!["key1".to_string()],
+        },
+        }).expect("to_value"),
+        r#"{"name": "foo", "description": null, "parameters": {"type": "object", "properties": {"key1": 1, "key2": 2}, "required": ["key1"]}}"#
+    )]
+    #[case(serde_json::to_value(Function {
+        name: "foo".to_string(),
+        description: Some("bar".to_string()),
+        parameters: FunctionParameters {
+            r#type: "object".to_string(),
+            properties: Some(
+                [("key".to_string(), serde_json::json!({"inner1": 1, "inner2": 2}))].into_iter().collect(),
+            ),
+            required: vec![],
+        },
+        }).expect("to_value"),
+        r#"{"name": "foo", "description": "bar", "parameters": {"type": "object", "properties": {"key": {"inner1": 1, "inner2": 2}}, "required": []}}"#
+    )]
+    #[case(serde_json::to_value(Function {
+        name: "foo".to_string(),
+        description: Some("bar".to_string()),
+        parameters: FunctionParameters {
+            r#type: "object".to_string(),
+            properties: Some(
+                [("key".to_string(), serde_json::json!([1, 2, 3]))].into_iter().collect(),
+            ),
+            required: vec![],
+        },
+        }).expect("to_value"),
+        r#"{"name": "foo", "description": "bar", "parameters": {"type": "object", "properties": {"key": [1, 2, 3]}, "required": []}}"#
+    )]
+    fn test_to_spaced_string(#[case] input_struct: serde_json::Value, #[case] expected: &str) {
+        let spaced_string = to_spaced_string(&input_struct).expect("to_spaced_string");
+        assert_eq!(spaced_string, expected);
+    }
+
+    #[rstest]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec![
+                "bos".to_string(),
+                "eos".to_string(),
+                "pad".to_string(),
+                "regular1".to_string(),
+                "regular2".to_string(),
+            ]),
+            token_type: Some(vec![3, 4, 4, 1, 1]),
+            ..Default::default()
+        },
+        BTreeSet::from([0, 1, 2])
+    )]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec![
+                "bos".to_string(),
+                "eos".to_string(),
+                "pad".to_string(),
+                "regular1".to_string(),
+                "regular2".to_string(),
+                "eom".to_string(),
+            ]),
+            token_type: Some(vec![3, 4, 4, 1, 1, 1]),
+            eom_token_id: Some(5),
+            ..Default::default()
+        },
+        BTreeSet::from([0, 1, 2, 5])
+    )]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec![
+                "bos".to_string(),
+                "eos".to_string(),
+                "pad".to_string(),
+                "regular1".to_string(),
+                "regular2".to_string(),
+                "eom".to_string(),
+            ]),
+            token_type: Some(vec![3, 4, 4, 1, 1, 1]),
+            eom_token_id: Some(5),
+            padding_token_id: Some(2),
+            ..Default::default()
+        },
+        BTreeSet::from([0, 1, 2, 5])
+    )]
+    fn test_configure_special_tokens(
+        #[case] config: TokenizerConfig,
+        #[case] expected: BTreeSet<u32>,
+    ) {
+        let builder = TokenizerServiceBuilder::default();
+        let special_tokens = builder
+            .configure_special_tokens(&config)
+            .expect("configure_special_tokens");
+        assert_eq!(special_tokens, expected);
+    }
+
+    #[rstest]
+    #[case(Some("glm4".to_string()))]
+    #[case(None)]
+    fn test_configure_pre_tokenizer_types(#[case] pre_tag_opt: Option<String>) {
+        let builder = TokenizerServiceBuilder::default();
+        let pt_wrapper = builder
+            .configure_pre_tokenizer(&pre_tag_opt)
+            .expect("Should configure successfully");
+        match pre_tag_opt.as_deref() {
+            Some("glm4") => {
+                // Verify that "glm4" produces a Sequence wrapper variant
+                assert!(
+                    matches!(pt_wrapper, PreTokenizerWrapper::Sequence(_)),
+                    "Expected PreTokenizerWrapper::Sequence for glm4, got {:?}",
+                    pt_wrapper
+                );
+            }
+            _ => {
+                // Verify that default produces a pure ByteLevel wrapper variant
+                assert!(
+                    matches!(pt_wrapper, PreTokenizerWrapper::ByteLevel(_)),
+                    "Expected PreTokenizerWrapper::ByteLevel for fallback, got {:?}",
+                    pt_wrapper
+                );
+            }
+        }
+    }
+
+    #[rstest]
+    #[case(
+        TokenizerConfig {
+            token_type: Some(vec![1, 1, 1]),
+            merges: Some(vec!["a b".to_string(), "b c".to_string()]),
+            ..Default::default()
+        },
+        "tokens are required to build tokenizer but were not found"
+    )]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            token_type: Some(vec![1, 2, 3]),
+            ..Default::default()
+        },
+        "merges are required to build tokenizer but were not found"
+    )]
+    fn test_build_bpe_tokenizer_failure(
+        #[case] tokenizer_config: TokenizerConfig,
+        #[case] expected_error_str: &str,
+    ) {
+        let builder = TokenizerServiceBuilder::default();
+        let result = builder
+            .build_bpe_tokenizer(&tokenizer_config)
+            .expect_err("build_bpe_tokenizer should fail, but did not");
+        assert!(result.to_string().contains(expected_error_str));
+    }
+
+    #[test]
+    fn test_build_bpe_tokenizer_filter_merges() {
+        let builder = TokenizerServiceBuilder::default();
+        let tokenizer_config = TokenizerConfig {
+            tokens: Some(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "ab".to_string(),
+                "bc".to_string(),
+            ]),
+            token_type: Some(vec![1, 2, 3]),
+            merges: Some(vec![
+                "a b".to_string(),
+                "b c".to_string(),
+                "a b c".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let tokenizer = builder
+            .build_bpe_tokenizer(&tokenizer_config)
+            .expect("build_bpe_tokenizer should succeed");
+
+        let model = tokenizer.get_model();
+        let model_json = serde_json::to_value(model).expect("model serialize should succeed");
+        let actual_merges = model_json
+            .get("merges")
+            .and_then(|m| m.as_array())
+            .expect("BPE serialization should contain a merges array");
+
+        assert!(
+            actual_merges.contains(&serde_json::json!(["a", "b"])),
+            "Expected merges to contain ['a', 'b'], but got: {:?}",
+            actual_merges
+        );
+        assert!(
+            actual_merges.contains(&serde_json::json!(["b", "c"])),
+            "Expected merges to contain ['b', 'c'], but got: {:?}",
+            actual_merges
+        );
+        assert!(!actual_merges.contains(&serde_json::json!("a b c")));
+        assert!(!actual_merges.contains(&serde_json::json!(["a", "b", "c"])));
+    }
+
+    #[rstest]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            token_type: Some(vec![1, 1, 1]),
+            merges: Some(vec!["a b".to_string(), "b c".to_string()]),
+            add_bos: true,
+            ..Default::default()
+        },
+        vec![(String::from("eos_token"), 2), (String::from("unknown_token"), 0)],
+        "bos_token is not present in special_tokens"
+    )]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            token_type: Some(vec![1, 1, 1]),
+            merges: Some(vec!["a b".to_string(), "b c".to_string()]),
+            add_eos: true,
+            ..Default::default()
+        },
+        vec![(String::from("bos_token"), 1), (String::from("unknown_token"), 0)],
+        "eos_token is not present in special_tokens"
+    )]
+    fn test_set_postprocessor_failure(
+        #[case] config: TokenizerConfig,
+        #[case] special_tokens: Vec<(String, u32)>,
+        #[case] expected_error_str: &str,
+    ) {
+        let builder = TokenizerServiceBuilder::default();
+        let result = builder
+            .set_post_processor(&config, special_tokens)
+            .expect_err("set_postprocessor should fail, but did not");
+        assert!(result.to_string().contains(expected_error_str));
+    }
+
+    #[rstest]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            token_type: Some(vec![1, 1, 1]),
+            merges: Some(vec!["a b".to_string(), "b c".to_string()]),
+            ..Default::default()
+        },
+        vec![],
+        ""
+    )]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec!["a".to_string(), "bos_token".to_string(), "c".to_string()]),
+            token_type: Some(vec![1, 1, 1]),
+            merges: Some(vec!["a b".to_string(), "b c".to_string()]),
+            add_bos: true,
+            bos_token_id: Some(1),
+            ..Default::default()
+        },
+        vec![(String::from("bos_token"), 1), (String::from("pad_token"), 2)],
+        "bos_token"
+    )]
+    #[case(
+        TokenizerConfig {
+            tokens: Some(vec!["a".to_string(), "b".to_string(), "eos_token".to_string()]),
+            token_type: Some(vec![1, 1, 1]),
+            merges: Some(vec!["a b".to_string(), "b c".to_string()]),
+            add_eos: true,
+            eos_token_id: Some(2),
+            ..Default::default()
+        },
+        vec![(String::from("bos_token"), 1), (String::from("eos_token"), 2)],
+        "eos_token"
+    )]
+    fn test_set_postprocessor_success(
+        #[case] config: TokenizerConfig,
+        #[case] special_tokens: Vec<(String, u32)>,
+        #[case] expected_token_in_template: &str,
+    ) {
+        let builder = TokenizerServiceBuilder::default();
+        let result = builder
+            .set_post_processor(&config, special_tokens)
+            .expect("set_postprocessor should succeed, but did not");
+        assert!(result.is_some());
+        let template_processing = result.unwrap();
+        let template_json_str = serde_json::to_string(&template_processing)
+            .expect("template_processing serialize should succeed");
+        assert!(template_json_str.contains(expected_token_in_template));
     }
 }

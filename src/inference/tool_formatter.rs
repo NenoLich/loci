@@ -1,20 +1,26 @@
 use crate::inference::PostSamplingConfig;
 use crate::tokenizer::{StreamContext, Tokenizer};
+#[cfg(test)]
+use mockall::automock;
+use std::any::Any;
 use std::mem::take;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ToolFormatStyle {
     XmlArgPairs,  // GLM-4 / Qwen 2.5 XML syntax
+    #[default]
     EnclosedJson, // Qwen standard / Mistral JSON block
     PythonCall,   // Llama 3 custom script syntax
 }
 
+#[cfg_attr(test, automock)]
 pub trait ToolArgFormatter {
-    fn build_tool_call_template(
+    #[allow(clippy::needless_lifetimes)]
+    fn build_tool_call_template<'a>(
         &self,
         tool_call_start_token_id: &u32,
-        tool_name: Option<&str>,
+        tool_name: Option<&'a str>,
         tokenizer: &dyn Tokenizer,
     ) -> anyhow::Result<Vec<u32>>;
     fn try_strip_name_prefix(&self, decoded_buffer: &mut String) -> bool;
@@ -35,6 +41,7 @@ pub trait ToolArgFormatter {
         stream_ctx: &mut StreamContext,
     ) -> anyhow::Result<()>;
     fn reset(&mut self);
+    fn as_any(&self) -> &dyn Any;
 }
 
 pub struct ToolArgFormatterBuilder<'a> {
@@ -217,6 +224,9 @@ impl ToolArgFormatter for XmlArgPairsFormatter {
     }
 
     fn reset(&mut self) {}
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[derive(Default)]
@@ -385,6 +395,10 @@ impl ToolArgFormatter for EnclosedJsonFormatter {
         self.in_string = false;
         self.is_escaping = false;
         self.bracket_depth = 0;
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -566,5 +580,309 @@ impl ToolArgFormatter for PythonCallFormatter {
         self.in_string = false;
         self.is_escaping = false;
         self.bracket_depth = 0;
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::MockTokenizer;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(1, 2, 3, 4, vec![], "".to_string(), r#""#.to_string())]
+    #[case(1, 2, 3, 4, vec![19], "".to_string(), r#"{"BYPASSED"#.to_string())]
+    #[case(1, 2, 3, 4, vec![19, 2, 3, 19, 4], "".to_string(), r#"{"BYPASSED": "BYPASSED""#.to_string())]
+    #[case(1, 2, 3, 4, vec![19, 2, 3, 19, 4, 1, 19, 19, 2, 3, 19, 19, 4], "".to_string(), r#"{"BYPASSED": "BYPASSED", "BYPASSEDBYPASSED": "BYPASSEDBYPASSED""#.to_string())]
+    fn test_xml_arg_pairs_formatter_format_args(
+        #[case] arg_key_open_token_id: u32,
+        #[case] arg_key_close_token_id: u32,
+        #[case] arg_value_open_token_id: u32,
+        #[case] arg_value_close_token_id: u32,
+        #[case] token_ids: Vec<u32>,
+        #[case] decoded_buffer: String,
+        #[case] decoded_buffer_expected: String,
+    ) {
+        let mut formatter = XmlArgPairsFormatter::new(
+            arg_key_open_token_id,
+            arg_key_close_token_id,
+            arg_value_open_token_id,
+            arg_value_close_token_id,
+        )
+        .unwrap();
+        let mut decoded_buffer = decoded_buffer;
+        let mut stream_ctx = StreamContext::with_capacity(10);
+        let mut tokenizer = MockTokenizer::new();
+        tokenizer
+            .expect_process_token_stream()
+            .returning(|_, _| Ok(Some("BYPASSED".to_string())));
+
+        let _ = formatter.format_args(&token_ids, &mut decoded_buffer, &tokenizer, &mut stream_ctx);
+        formatter.fix_json(&mut decoded_buffer, true);
+
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(true, "".to_string(), "".to_string())]
+    #[case(false, "BYPASSED".to_string(), "BYPASSED".to_string())]
+    #[case(true, "BYPASSED".to_string(), r#"{"BYPASSED"#.to_string())]
+    fn test_xml_arg_pairs_formatter_fix_json(
+        #[case] first_chunk: bool,
+        #[case] decoded_buffer: String,
+        #[case] decoded_buffer_expected: String,
+    ) {
+        let mut formatter = XmlArgPairsFormatter::new(1, 2, 3, 4).unwrap();
+        let mut decoded_buffer = decoded_buffer;
+        formatter.fix_json(&mut decoded_buffer, first_chunk);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(9, None, vec![19], vec![9])]
+    #[case(9, Some("Name"), vec![19], vec![9, 19])]
+    #[case(9, Some("Name"), vec![19, 2, 3, 19, 4], vec![9, 19, 2, 3, 19, 4])]
+    fn test_xml_arg_pairs_formatter_build_tool_call_template(
+        #[case] tool_call_start_token_id: u32,
+        #[case] tool_name: Option<&str>,
+        #[case] tool_name_encoded: Vec<u32>,
+        #[case] expected: Vec<u32>,
+    ) {
+        let formatter = XmlArgPairsFormatter::new(1, 2, 3, 4).unwrap();
+        let mut tokenizer = MockTokenizer::new();
+        tokenizer
+            .expect_encode()
+            .returning(move |_, _| Ok(tool_name_encoded.clone()));
+        let result =
+            formatter.build_tool_call_template(&tool_call_start_token_id, tool_name, &tokenizer);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case(r#"{"name": ""#, "", true)]
+    #[case(r#"{"name": "name"#, "name", true)]
+    #[case(r#"prefix{"name": ""#, "", true)]
+    #[case(r#"wdewdwe"#, "wdewdwe", false)]
+    #[case(r#"prefix{"name": "name"#, "name", true)]
+    fn test_enclosed_json_formatter_try_strip_name_prefix(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_buffer_expected: &str,
+        #[case] expected: bool,
+    ) {
+        let formatter = EnclosedJsonFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        let result = formatter.try_strip_name_prefix(&mut decoded_buffer);
+        assert_eq!(result, expected);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(r#"na"#, Some(r#"me""#.to_string()), "", Some("name".to_string()))]
+    #[case(r#"name"#, None, r#"name"#, None)]
+    #[case(r#"name"#, Some(r#"""#.to_string()), "", Some("name".to_string()))]
+    #[case(r#"name"#, Some(r#""arg"#.to_string()), "arg", Some("name".to_string()))]
+    #[case(r#"na"#, Some(r#"me"#.to_string()), "name", None)]
+    fn test_enclosed_json_formatter_try_extract_function_name(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_tokens: Option<String>,
+        #[case] decoded_buffer_expected: &str,
+        #[case] expected_name: Option<String>,
+    ) {
+        let formatter = EnclosedJsonFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        let mut tokenizer = MockTokenizer::new();
+        tokenizer
+            .expect_process_multiple_token_stream()
+            .returning(move |_, _| Ok(decoded_tokens.clone()));
+        let token_ids = vec![1, 2, 3];
+        let result = formatter.try_extract_function_name(
+            &token_ids,
+            &mut decoded_buffer,
+            &tokenizer,
+            &mut StreamContext::with_capacity(10),
+        );
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, expected_name);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(r#""arguments":"#, "", true)]
+    #[case(r#""arguments":suffix"#, "suffix", true)]
+    #[case(r#""#, "", false)]
+    #[case(r#"wdewdwe"#, "wdewdwe", false)]
+    #[case(r#"prefix"arguments":suffix"#, "suffix", true)]
+    fn test_enclosed_json_formatter_try_strip_arguments_prefix(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_buffer_expected: &str,
+        #[case] expected: bool,
+    ) {
+        let formatter = EnclosedJsonFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        let result = formatter.try_strip_arguments_prefix(&mut decoded_buffer);
+        assert_eq!(result, expected);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(r#""#, r#""#)]
+    #[case(r#"}}"#, r#""#)]
+    #[case(r#"{}}"#, r#"{}"#)]
+    #[case(r#"{}"}""#, r#"{}"}""#)]
+    #[case(r#"]{}}"#, r#"{}"#)]
+    fn test_enclosed_json_formatter_fix_json(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_buffer_expected: &str,
+    ) {
+        let mut formatter = EnclosedJsonFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        formatter.fix_json(&mut decoded_buffer, false);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[test]
+    fn test_enclosed_json_formatter_reset() {
+        let mut formatter = EnclosedJsonFormatter::new().unwrap();
+        formatter.in_string = true;
+        formatter.is_escaping = true;
+        formatter.bracket_depth = 1;
+        formatter.reset();
+        assert!(!formatter.in_string);
+        assert!(!formatter.is_escaping);
+        assert_eq!(formatter.bracket_depth, 0);
+    }
+
+    #[rstest]
+    #[case(r#""#, r#""#, false)]
+    #[case(r#"some"#, r#"{"some"#, true)]
+    #[case(r#""}some"#, r#""}some"#, false)]
+    #[case(r#"())"#, r#"()}"#, false)]
+    #[case(r#"]some"#, r#"}"#, false)]
+    #[case(r#"arg="value")"#, r#"{"arg": "value"}"#, true)]
+    #[case(
+        r#"arg1="value1", arg2="value2")"#,
+        r#"{"arg1": "value1", "arg2": "value2"}"#,
+        true
+    )]
+    fn test_python_call_formatter_fix_json(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_buffer_expected: &str,
+        #[case] first_chunk: bool,
+    ) {
+        let mut formatter = PythonCallFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        formatter.fix_json(&mut decoded_buffer, first_chunk);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(r#"na"#, Some(r#"me("#.to_string()), "", Some("name".to_string()))]
+    #[case(r#"name"#, None, r#"name"#, None)]
+    #[case(r#"name"#, Some(r#"("#.to_string()), "", Some("name".to_string()))]
+    #[case(r#"name"#, Some(r#"(arg"#.to_string()), "arg", Some("name".to_string()))]
+    #[case(r#"na"#, Some(r#"me"#.to_string()), "name", None)]
+    #[case(r#"."#, Some(r#",("#.to_string()), ".,", None)]
+    fn test_python_call_formatter_try_extract_function_name(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_tokens: Option<String>,
+        #[case] decoded_buffer_expected: &str,
+        #[case] expected_name: Option<String>,
+    ) {
+        let formatter = PythonCallFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        let mut tokenizer = MockTokenizer::new();
+        tokenizer
+            .expect_process_multiple_token_stream()
+            .returning(move |_, _| Ok(decoded_tokens.clone()));
+        let token_ids = vec![1, 2, 3];
+        let result = formatter.try_extract_function_name(
+            &token_ids,
+            &mut decoded_buffer,
+            &tokenizer,
+            &mut StreamContext::with_capacity(10),
+        );
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, expected_name);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(r#"("#, "", false)]
+    #[case(r#"some"#, "some", true)]
+    #[case(r#"some("#, "some", true)]
+    #[case(r#""#, "", false)]
+    #[case(r#"some_some"#, "some_some", true)]
+    fn test_python_call_formatter_try_strip_arguments_prefix(
+        #[case] decoded_buffer: &str,
+        #[case] decoded_buffer_expected: &str,
+        #[case] expected: bool,
+    ) {
+        let formatter = PythonCallFormatter::new().unwrap();
+        let mut decoded_buffer = decoded_buffer.to_string();
+        let result = formatter.try_strip_arguments_prefix(&mut decoded_buffer);
+        assert_eq!(result, expected);
+        assert_eq!(decoded_buffer, decoded_buffer_expected);
+    }
+
+    #[rstest]
+    #[case(ToolFormatStyle::XmlArgPairs, Some(1), Some(2), Some(3), Some(4), None)]
+    #[case(ToolFormatStyle::EnclosedJson, None, None, None, None, None)]
+    #[case(ToolFormatStyle::PythonCall, None, None, None, None, None)]
+    #[case(ToolFormatStyle::XmlArgPairs, None, Some(2), Some(3), Some(4), Some("Missing arg_key_open_token_id for XmlArgPairsFormatter".to_string()))]
+    fn test_tool_arg_formatter_build(
+        #[case] tool_call_format_style: ToolFormatStyle,
+        #[case] arg_key_open_token_id: Option<u32>,
+        #[case] arg_key_close_token_id: Option<u32>,
+        #[case] arg_value_open_token_id: Option<u32>,
+        #[case] arg_value_close_token_id: Option<u32>,
+        #[case] expected_error: Option<String>,
+    ) {
+        let config = PostSamplingConfig {
+            tool_call_format_style,
+            arg_key_open_token_id,
+            arg_key_close_token_id,
+            arg_value_open_token_id,
+            arg_value_close_token_id,
+            ..Default::default()
+        };
+
+        let builder = ToolArgFormatterBuilder::new(&config);
+        let formatter_result = builder.build();
+        match formatter_result {
+            Ok(formatter) => match config.tool_call_format_style {
+                ToolFormatStyle::XmlArgPairs => {
+                    assert!(formatter.as_any().is::<XmlArgPairsFormatter>());
+                }
+                ToolFormatStyle::EnclosedJson => {
+                    assert!(formatter.as_any().is::<EnclosedJsonFormatter>());
+                }
+                ToolFormatStyle::PythonCall => {
+                    assert!(formatter.as_any().is::<PythonCallFormatter>());
+                }
+            },
+            Err(e) => {
+                assert!(e.to_string().contains(&expected_error.unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_python_call_formatter_reset() {
+        let mut formatter = PythonCallFormatter::new().unwrap();
+        formatter.in_string = true;
+        formatter.is_escaping = true;
+        formatter.bracket_depth = 1;
+        formatter.reset();
+        assert!(!formatter.in_string);
+        assert!(!formatter.is_escaping);
+        assert_eq!(formatter.bracket_depth, 0);
     }
 }

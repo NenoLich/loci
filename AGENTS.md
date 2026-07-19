@@ -27,11 +27,13 @@ cargo run --release -- serve -b 127.0.0.1:8000 -c default_config.toml
 ## Key conventions
 
 - **Edition 2024**, stable Rust.
-- **No unsafe** — entire codebase is safe Rust.
 - **Builder pattern** for configs (`InferenceConfig::builder().dtype(...).build()`).
 - **thiserror** for error enums; `anyhow` for top-level error propagation.
 - **tracing** for logging (not `log`/`println`). Set `RUST_LOG=debug` for verbose output.
-- **No tests exist** — do not expect or run tests.
+- **Run tests with** `cargo test --features mock`.
+- mockall is an optional dependency; integration tests need `mock` feature for `MockModel`/`MockTokenizer`.
+- Integration tests in `tests/`: `pipeline_generation.rs`, `config_file_loading.rs`, `api_server.rs`.
+- Shared test fixtures in `tests/fixtures/mod.rs`.
 - **GGUF parsing** is in `src/gguf/`; model architectures in `src/model/model_impls/`.
 - To add a new model architecture: implement `Model` trait in `model_impls/` + config parser in `config/parser/`.
 

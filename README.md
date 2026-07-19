@@ -95,11 +95,13 @@ See [`default_config.toml`](./default_config.toml) for all options. CLI flags ov
 
 ```
 src/
+├── lib.rs               # Library root
 ├── main.rs              # Entry point
 ├── cli.rs               # CLI argument parsing and dispatch
 ├── error.rs             # Error types
 ├── types.rs             # Core types (messages, tools, etc.)
 ├── render.rs            # Streaming output rendering
+├── profiling.rs         # Profiling macros
 ├── tokenizer.rs         # Tokenizer service
 ├── config/              # Configuration subsystem
 │   ├── file_config.rs
@@ -132,6 +134,12 @@ src/
     ├── handlers.rs
     ├── types.rs
     └── worker.rs
+tests/
+├── api_server.rs
+├── config_file_loading.rs
+├── pipeline_generation.rs
+└── fixtures/
+    └── mod.rs
 ```
 
 ## License
