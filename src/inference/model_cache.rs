@@ -114,7 +114,7 @@ impl ModelCacheManagerInterface for ModelCacheManager {
         };
         let cache_file_path = self.cache_dir.join(format!(
             "cache-{}-blk-size-{}-{}.safetensors",
-            &self.model,
+            self.model,
             block_size,
             Uuid::new_v4()
         ));

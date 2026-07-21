@@ -8,10 +8,10 @@ use std::mem::take;
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ToolFormatStyle {
-    XmlArgPairs,  // GLM-4 / Qwen 2.5 XML syntax
+    XmlArgPairs, // GLM-4 / Qwen 2.5 XML syntax
     #[default]
     EnclosedJson, // Qwen standard / Mistral JSON block
-    PythonCall,   // Llama 3 custom script syntax
+    PythonCall,  // Llama 3 custom script syntax
 }
 
 #[cfg_attr(test, automock)]

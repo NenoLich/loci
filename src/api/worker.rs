@@ -210,7 +210,7 @@ fn run_stream_generation(
             .unwrap()
             .as_secs(),
         model: model_name.to_string(),
-        system_fingerprint: format!("loci-{}", &model_name),
+        system_fingerprint: format!("loci-{}", model_name),
     };
 
     let initial_chunk = build_initial_chunk(static_data.clone());
@@ -526,16 +526,16 @@ mod tests {
     use super::*;
     use crate::types::{
         ChatMessage, ChunkFunctionCall, ChunkToolCall, CompletionTokensDetails,
-        PromptTokensDetails, Usage, ModelCacheFragmentation
+        ModelCacheFragmentation, PromptTokensDetails, Usage,
     };
-    use insta::assert_json_snapshot;
     use candle_core::Device;
+    use insta::assert_json_snapshot;
 
-    use crate::tokenizer::MockTokenizer;
-    use crate::model::model_base::{MockModel, ModelCacheType};
-    use crate::inference::PostSamplingConfig;
     use crate::config::GenerationConfig;
+    use crate::inference::PostSamplingConfig;
     use crate::inference::model_cache::{MockCacheLoader, MockModelCacheManagerInterface};
+    use crate::model::model_base::{MockModel, ModelCacheType};
+    use crate::tokenizer::MockTokenizer;
 
     fn mock_static_chat_completions_data() -> StaticChatCompletionData {
         StaticChatCompletionData {
